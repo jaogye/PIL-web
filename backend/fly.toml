@@ -1,0 +1,36 @@
+# Fly.io configuration for the LIP2 backend (FastAPI).
+# Deploy with: fly deploy --config fly.toml
+# from inside the /backend directory.
+
+app = "lip2-api"
+primary_region = "dfw"   # Dallas – mia is deprecated
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8000"
+  DEBUG = "false"
+  ALLOWED_ORIGINS = "https://lip2-app.fly.dev,http://localhost:5173,http://localhost:3000"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 100
+    soft_limit = 80
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
+
+[[metrics]]
+  port = 9091
+  path = "/metrics"

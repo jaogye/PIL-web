@@ -1,0 +1,58 @@
+services:
+
+  # ── PostgreSQL + PostGIS ──────────────────────────────────────────────────
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: lip2
+      POSTGRES_PASSWORD: lip2
+      POSTGRES_DB: lip2_ecuador
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/migrations/001_initial_schema.sql:/docker-entrypoint-initdb.d/001_initial_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lip2 -d lip2_ecuador"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── FastAPI Backend ───────────────────────────────────────────────────────
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://lip2:lip2@db:5432/lip2_ecuador
+      AVAILABLE_DATABASES: '["lip2_ecuador","lip2_belgium"]'
+      DEBUG: "true"
+      ALLOWED_ORIGINS: '["http://localhost:5173","http://localhost:3000"]'
+    volumes:
+      # Mount source for hot-reload during development.
+      - ./backend/app:/app/app
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+
+  # ── React Frontend ────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    environment:
+      RESOLVER: "127.0.0.11"
+      BACKEND_URL: "http://api:8000"
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:

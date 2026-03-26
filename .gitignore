@@ -1,0 +1,87 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+.pytest_cache/
+.mypy_cache/
+
+
+# Claude 
+.claude.md 
+.claude 
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Node
+node_modules/
+frontend/dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Fly.io
+.fly/
+
+# ── OSM / OSRM data files (large binary, not for version control) ──────────
+*.osm.pbf
+*.osm.bz2
+*.osm.gz
+*.osrm
+*.osrm.cell_metrics
+*.osrm.cells
+*.osrm.cnbg
+*.osrm.cnbg_to_ebg
+*.osrm.datasource_names
+*.osrm.ebg
+*.osrm.ebg_nodes
+*.osrm.edges
+*.osrm.enw
+*.osrm.fileIndex
+*.osrm.geometry
+*.osrm.icd
+*.osrm.maneuver_overrides
+*.osrm.mldgr
+*.osrm.names
+*.osrm.nbg_nodes
+*.osrm.partition
+*.osrm.properties
+*.osrm.ramIndex
+*.osrm.restrictions
+*.osrm.timestamp
+*.osrm.tld
+*.osrm.tls
+*.osrm.turn_duration_penalties
+*.osrm.turn_penalties_index
+*.osrm.turn_weight_penalties
+
+# ── ETL download cache (large ZIPs downloaded by migration scripts) ─────────
+backend/scripts/belgium/*.zip
+backend/scripts/belgium/*.shp
+backend/scripts/belgium/*.dbf
+backend/scripts/belgium/*.shx
+backend/scripts/belgium/*.prj
+backend/scripts/belgium/*.cpg
+backend/scripts/belgium/*.txt
+backend/scripts/**/_extract/
+backend/scripts/**/sectors*/
+backend/scripts/**/pois*/
+
+# ── Temporary analysis / debug files ───────────────────────────────────────
+*.png
+tmp.*
+speed_histogram.*
+
+# ── Validation / scratch scripts left at project root ──────────────────────
+validate_distances.py
