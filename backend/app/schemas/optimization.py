@@ -12,6 +12,7 @@ class ModelType(str, Enum):
     P_MEDIAN = "p_median"
     P_CENTER = "p_center"
     MAX_COVERAGE = "max_coverage"
+    BUMP_HUNTER = "bump_hunter"
 
 
 class OptimizationMode(str, Enum):
@@ -35,9 +36,10 @@ class OptimizationRequest(BaseModel):
     description: str | None = None
 
     model_type: ModelType
-    p_facilities: int = Field(..., ge=1, le=200)
+    # Required for all models except bump_hunter (which has no fixed p).
+    p_facilities: int | None = Field(None, ge=1, le=500)
 
-    # Required for MAX_COVERAGE and P_CENTER.
+    # Required for MAX_COVERAGE and BUMP_HUNTER.
     service_radius: float | None = Field(None, ge=1.0, le=600.0)
 
     scope_filters: ScopeFilters | None = None
@@ -57,12 +59,24 @@ class OptimizationRequest(BaseModel):
     # When provided, overrides the complete_existing mode lookup.
     fixed_census_area_ids: list[int] | None = None
 
+    # Target population to use as demand (references target_population.id).
+    # If None, the default for the selected facility_type is used.
+    target_population_id: int | None = None
+
+    @field_validator("p_facilities")
+    @classmethod
+    def p_required_for_non_bump(cls, v, info):
+        model = info.data.get("model_type")
+        if model != ModelType.BUMP_HUNTER and v is None:
+            raise ValueError("p_facilities is required for this model type")
+        return v
+
     @field_validator("service_radius")
     @classmethod
     def radius_required_for_coverage(cls, v, info):
         model = info.data.get("model_type")
-        if model == ModelType.MAX_COVERAGE and v is None:
-            raise ValueError("service_radius is required for max_coverage model")
+        if model in (ModelType.MAX_COVERAGE, ModelType.BUMP_HUNTER) and v is None:
+            raise ValueError("service_radius is required for max_coverage and bump_hunter models")
         return v
 
 
@@ -95,6 +109,15 @@ class FacilityLocation(BaseModel):
     served_areas: list[ServedAreaInfo] = []
 
 
+class UnassignedAreaInfo(BaseModel):
+    """A census area in the scope that was not assigned to any facility."""
+    census_area_id: int
+    area_code: str | None = None
+    name: str | None = None
+    x: float | None = None
+    y: float | None = None
+
+
 class OptimizationResponse(BaseModel):
     scenario_id: int
     name: str
@@ -104,6 +127,8 @@ class OptimizationResponse(BaseModel):
     status: str
     facility_locations: list[FacilityLocation]
     stats: dict[str, Any]
+    # Census areas in scope with demand > 0 that were not served by any facility.
+    unassigned_areas: list[UnassignedAreaInfo] = []
 
 
 # ------------------------------------------------------------------ #

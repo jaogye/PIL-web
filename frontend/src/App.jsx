@@ -165,23 +165,44 @@ function AppInner() {
   const handleReoptimize = async () => {
     if (!optimizationResult?._payload) return;
 
-    const originalFacilityIds = (optimizationResult.facility_locations || []).map((f) => f.census_area_id);
-    const fixedIds = [
-      ...originalFacilityIds.filter((id) => !userEdits.removed.has(id)),
-      ...Array.from(userEdits.added).filter((id) => !originalFacilityIds.includes(id)),
-    ];
-
-    const newP = Math.min(200, Math.max(optimizationResult.p_facilities ?? fixedIds.length, fixedIds.length));
+    // Only fix facilities that were already existing (user-created) or manually
+    // added by the user.  Algorithm-suggested planned facilities are NOT fixed
+    // so the solver can reassign them freely.
+    const isBumpHunter = optimizationResult.model_type === "bump_hunter";
     const baseName = optimizationResult.name || "Scenario";
     const reoptName = `Reopt_${baseName}`.slice(0, 255);
 
-    const payload = {
-      ...optimizationResult._payload,
-      name: reoptName,
-      p_facilities: newP,
-      mode: "from_scratch",
-      fixed_census_area_ids: fixedIds,
-    };
+    let payload;
+    if (isBumpHunter) {
+      // Fix all current bumps + manually added areas; re-run only the assignment step.
+      const allBumpIds = (optimizationResult.facility_locations || [])
+        .filter((f) => !userEdits.removed.has(f.census_area_id))
+        .map((f) => f.census_area_id);
+      const fixedIds = Array.from(new Set([...allBumpIds, ...userEdits.added]));
+      payload = {
+        ...optimizationResult._payload,
+        name: reoptName,
+        mode: "from_scratch",
+        fixed_census_area_ids: fixedIds,
+        parameters: undefined,  // skip bump-hunter algorithm; just reassign
+      };
+    } else {
+      const fixedIds = Array.from(new Set([
+        ...(optimizationResult.facility_locations || [])
+          .filter((f) => f.is_existing && !userEdits.removed.has(f.census_area_id))
+          .map((f) => f.census_area_id),
+        ...userEdits.added,
+      ]));
+      const baseP = optimizationResult.p_facilities ?? fixedIds.length;
+      const newP = Math.min(200, Math.max(baseP, fixedIds.length));
+      payload = {
+        ...optimizationResult._payload,
+        name: reoptName,
+        p_facilities: newP,
+        mode: "from_scratch",
+        fixed_census_area_ids: fixedIds,
+      };
+    }
 
     setReoptimizeStatus("running");
     setReoptimizeError(null);
@@ -243,6 +264,7 @@ function AppInner() {
         <MapView
           facilities={optimizationResult?.facility_locations ?? []}
           existingFacilities={visibleExistingFacilities}
+          unassignedAreas={optimizationResult?.unassigned_areas ?? []}
           serviceRadius={optimizationResult?.service_radius}
           selectedDb={selectedDb}
           removedFacilityIds={userEdits.removed}

@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.dependencies import get_db, get_db_name
 from app.models.census import CensusArea
 from app.models.optimization import OptimizationResult, OptimizationScenario
+from app.models.target_population import CensusAreaPopulation, TargetPopulation
 
 import numpy as np
 
@@ -85,6 +86,21 @@ async def calculate_impacts(
     result = await db.execute(query)
     areas = result.scalars().all()
 
+    # Load total population (all_ages) for each area.
+    tp_result = await db.execute(
+        select(TargetPopulation).where(TargetPopulation.code == "all_ages")
+    )
+    tp = tp_result.scalar_one_or_none()
+    pop_map: dict[int, float] = {}
+    if tp:
+        pop_rows = await db.execute(
+            select(CensusAreaPopulation).where(
+                CensusAreaPopulation.census_area_id.in_([a.id for a in areas]),
+                CensusAreaPopulation.target_population_id == tp.id,
+            )
+        )
+        pop_map = {r.census_area_id: r.population for r in pop_rows.scalars().all()}
+
     # Build coordinate arrays for distance computation.
     xy = np.array([(a.x or 0.0, a.y or 0.0) for a in areas])
     facility_mask = np.array([a.id in selected_area_ids for a in areas])
@@ -97,7 +113,8 @@ async def calculate_impacts(
     covered_population = 0.0
 
     for i, area in enumerate(areas):
-        total_population += area.demand
+        area_pop = pop_map.get(area.id, 0.0)
+        total_population += area_pop
 
         if facility_xy.shape[0] == 0:
             travel_time = None
@@ -114,14 +131,14 @@ async def calculate_impacts(
         impact = AreaImpact(
             census_area_id=area.id,
             area_code=area.area_code,
-            population=area.demand,
+            population=area_pop,
             is_covered=is_covered,
             nearest_facility_id=nearest_fac,
             travel_time=round(travel_time, 2) if travel_time is not None else None,
         )
 
         if is_covered:
-            covered_population += area.demand
+            covered_population += area_pop
             covered_list.append(impact)
         else:
             uncovered_list.append(impact)

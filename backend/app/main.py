@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import get_settings
-from app.api.routes import optimization, infrastructure, impacts, reports, political_divisions
+from app.api.routes import optimization, infrastructure, impacts, reports, political_divisions, target_population
 from fastapi.responses import JSONResponse
 
 settings = get_settings()
@@ -55,6 +55,7 @@ app.include_router(infrastructure.router, prefix="/api/v1")
 app.include_router(impacts.router, prefix="/api/v1")
 app.include_router(reports.router, prefix="/api/v1")
 app.include_router(political_divisions.router, prefix="/api/v1")
+app.include_router(target_population.router, prefix="/api/v1")
 
 
 # ------------------------------------------------------------------ #

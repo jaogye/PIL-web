@@ -25,8 +25,7 @@ class CensusArea(Base):
 
     name: Mapped[str | None] = mapped_column(String(255))
 
-    # Population / demand attributes.
-    demand: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    # Service capacity of existing facilities at this area (students, patients/day, etc.).
     capacity: Mapped[float] = mapped_column(Float, default=0.0)
 
     # Geographic coordinates (WGS84 EPSG:4326).
@@ -35,6 +34,10 @@ class CensusArea(Base):
     # Raw X/Y as floats for fast in-memory operations without PostGIS.
     x: Mapped[float | None] = mapped_column(Float)
     y: Mapped[float | None] = mapped_column(Float)
+
+    # Median travel speed (km/h) derived from stored distance_matrix neighbours.
+    # Used to estimate travel times to areas not stored in distance_matrix.
+    avg_speed_kmh: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # FK to political_division (parroquia level).
     parish_id: Mapped[int | None] = mapped_column(
@@ -47,4 +50,4 @@ class CensusArea(Base):
     )
 
     def __repr__(self) -> str:
-        return f"<CensusArea code={self.area_code} demand={self.demand}>"
+        return f"<CensusArea code={self.area_code}>"

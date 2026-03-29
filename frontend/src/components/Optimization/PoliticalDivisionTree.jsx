@@ -58,7 +58,12 @@ function buildScopeLabel(tree, selectedParroquias, getCheckState) {
 
 // ─── Main component ─────────────────────────────────────────────────────────
 
-export default function PoliticalDivisionTree({ onChange, selectedDb = "lip2_ecuador" }) {
+export default function PoliticalDivisionTree({
+  onChange,
+  selectedDb = "lip2_ecuador",
+  targetPopulationId = null,
+  targetPopulationLabel = "Target population",
+}) {
   const [expanded, setExpanded] = useState(new Set());
   // selectedParroquias: Set of parroquia node IDs (leaf selection)
   const [selectedParroquias, setSelectedParroquias] = useState(new Set());
@@ -116,7 +121,7 @@ export default function PoliticalDivisionTree({ onChange, selectedDb = "lip2_ecu
     [selectedParroquias, getAllParroquias]
   );
 
-  // Notify parent and fetch census summary whenever selection changes
+  // Notify parent and fetch census summary whenever selection or target population changes
   useEffect(() => {
     const ids = [...selectedParroquias];
     if (ids.length === 0) {
@@ -125,9 +130,9 @@ export default function PoliticalDivisionTree({ onChange, selectedDb = "lip2_ecu
     }
     const scope_label = buildScopeLabel(tree, selectedParroquias, getCheckState);
     onChange({ parish_ids: ids, scope_label });
-    summaryMutation.mutate(ids);
+    summaryMutation.mutate({ parish_ids: ids, target_population_id: targetPopulationId });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedParroquias]);
+  }, [selectedParroquias, targetPopulationId]);
 
   if (isLoading) return <p style={hintStyle}>Loading political divisions…</p>;
   if (isError)   return <p style={{ ...hintStyle, color: "#ef4444" }}>Error loading tree.</p>;
@@ -165,9 +170,15 @@ export default function PoliticalDivisionTree({ onChange, selectedDb = "lip2_ecu
                 <strong>{summary.census_area_count.toLocaleString()}</strong>
               </div>
               <div style={summaryRowStyle}>
-                <span>Total demand:</span>
+                <span>Total population:</span>
                 <strong>{summary.total_demand.toLocaleString(undefined, { maximumFractionDigits: 0 })}</strong>
               </div>
+              {summary.target_population !== undefined && summary.target_population !== summary.total_demand && (
+                <div style={{ ...summaryRowStyle, color: "#2563eb" }}>
+                  <span>{targetPopulationLabel}:</span>
+                  <strong>{summary.target_population.toLocaleString(undefined, { maximumFractionDigits: 0 })}</strong>
+                </div>
+              )}
             </>
           )}
           <button

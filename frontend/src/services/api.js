@@ -70,9 +70,18 @@ export const politicalDivisionsApi = {
   /** Full provincia > canton > parroquia tree. */
   tree: () => client.get("/political-divisions/tree").then((r) => r.data),
 
-  /** Count and total demand for a set of parroquia IDs. */
-  censusSummary: (parish_ids) =>
-    client.post("/political-divisions/census-summary", { parish_ids }).then((r) => r.data),
+  /** Count and population for a set of parroquia IDs and a target population group. */
+  censusSummary: ({ parish_ids, target_population_id = null }) =>
+    client.post("/political-divisions/census-summary", { parish_ids, target_population_id }).then((r) => r.data),
+};
+
+// ─── Target Populations ────────────────────────────────────────────────────
+
+export const targetPopulationsApi = {
+  /** List all demographic target population groups. */
+  list: () => client.get("/target-populations/").then((r) => r.data),
+  /** List facility types with their default target_population_id. */
+  facilityTypes: () => client.get("/target-populations/facility-types").then((r) => r.data),
 };
 
 // ─── Reports ───────────────────────────────────────────────────────────────

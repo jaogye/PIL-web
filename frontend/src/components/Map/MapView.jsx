@@ -160,6 +160,7 @@ const ALL_VISIBLE = Object.fromEntries(LAYER_GROUPS.map((g) => [g.id, true]));
 export default function MapView({
   facilities = [],
   existingFacilities = [],
+  unassignedAreas = [],
   serviceRadius = null,
   selectedDb = "lip2_ecuador",
   removedFacilityIds = null,
@@ -168,10 +169,11 @@ export default function MapView({
   onAreaContextMenu = null,
   rebalancingTransfers = null,
 }) {
-  const mapContainer  = useRef(null);
-  const mapRef        = useRef(null);
-  const markersRef    = useRef([]);
-  const linesReadyRef = useRef(false);
+  const mapContainer      = useRef(null);
+  const mapRef            = useRef(null);
+  const markersRef        = useRef([]);
+  const linesReadyRef     = useRef(false);
+  const prevFacilitiesRef = useRef(null);
 
   // Use refs so event listeners always call the latest version without re-creating markers.
   const onFacilityContextMenuRef = useRef(onFacilityContextMenu);
@@ -400,6 +402,9 @@ export default function MapView({
     };
 
     const render = () => {
+      const wasEmpty = !prevFacilitiesRef.current || prevFacilitiesRef.current.length === 0;
+      prevFacilitiesRef.current = facilities;
+
       markersRef.current.forEach((m) => m.remove());
       markersRef.current = [];
 
@@ -407,7 +412,7 @@ export default function MapView({
 
       // 1. Service lines + square (census area) data.
       const lineFeatures = [];
-      // squareMap: census_area_id → { censusAreaId, x, y, demand, travel_time, area_code, facility_area_code }
+      // squareMap: census_area_id → { censusAreaId, x, y, demand, travel_time, area_code, facility_area_code, facility_x, facility_y }
       const squareMap = new Map();
 
       facilities.forEach((facility) => {
@@ -430,6 +435,8 @@ export default function MapView({
               travel_time: sa.travel_time,
               area_code: sa.area_code,
               facility_area_code: facility.area_code,
+              facility_x: facility.x,
+              facility_y: facility.y,
             });
           }
         });
@@ -443,7 +450,7 @@ export default function MapView({
       }
 
       // 2. Yellow squares (census areas) — clickable popup + right-click to add as facility.
-      squareMap.forEach(({ censusAreaId, x, y, demand, travel_time, area_code, facility_area_code }) => {
+      squareMap.forEach(({ censusAreaId, x, y, demand, travel_time, area_code, facility_area_code, facility_x, facility_y }) => {
         const isAdded = added.has(censusAreaId);
         const el = document.createElement("div");
 
@@ -466,6 +473,21 @@ export default function MapView({
         }
 
         const ttStr = travel_time != null ? `${Number(travel_time).toFixed(1)} min` : "—";
+
+        // Flat-earth Euclidean distance between census area and its facility.
+        let distKmStr = "—";
+        let speedStr  = "—";
+        if (facility_x != null && facility_y != null) {
+          const latMid = (y + facility_y) / 2 * Math.PI / 180;
+          const dxKm   = (facility_x - x) * 111.0 * Math.cos(latMid);
+          const dyKm   = (facility_y - y) * 111.0;
+          const distKm = Math.sqrt(dxKm * dxKm + dyKm * dyKm);
+          distKmStr = `${distKm.toFixed(2)} km`;
+          if (travel_time != null && travel_time > 0) {
+            speedStr = `${(distKm / (travel_time / 60)).toFixed(1)} km/h`;
+          }
+        }
+
         const popupHtml = isAdded
           ? `<strong>Proposed Facility</strong><br/>
              Code: <strong>${area_code || "—"}</strong><br/>
@@ -474,6 +496,8 @@ export default function MapView({
              Code: <strong>${area_code || "—"}</strong><br/>
              Demand: <strong>${(demand || 0).toLocaleString()}</strong><br/>
              Access time: <strong>${ttStr}</strong><br/>
+             Distance: <strong>${distKmStr}</strong><br/>
+             Travel speed: <strong>${speedStr}</strong><br/>
              Nearest facility: <strong>${facility_area_code || "—"}</strong><br/>
              <em style="color:#6b7280;font-size:0.75em">Right-click to add facility here</em>`;
 
@@ -487,7 +511,47 @@ export default function MapView({
         );
       });
 
-      // 3. Existing facilities (orange).
+      // 3. Unassigned areas — pink squares (areas not served by any facility).
+      unassignedAreas.forEach(({ census_area_id, area_code, name, x, y }) => {
+        if (!x || !y) return;
+        const isAdded = added.has(census_area_id);
+        const el = document.createElement("div");
+
+        if (isAdded) {
+          el.style.cssText = `
+            width: 18px; height: 18px;
+            background: #7c3aed; border: 2.5px solid #fff; border-radius: 50%;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.35); cursor: pointer;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 10px; color: #fff; font-weight: 700;
+          `;
+          el.textContent = "+";
+        } else {
+          el.style.cssText = `
+            width: 10px; height: 10px;
+            background: #f472b6; border: 1.5px solid #9d174d; cursor: pointer;
+          `;
+        }
+
+        const displayName = name || area_code || "—";
+        const popupHtml = isAdded
+          ? `<strong>Proposed Facility</strong><br/>
+             ${displayName}<br/>
+             <em style="color:#6b7280;font-size:0.75em">Right-click to cancel addition</em>`
+          : `<strong>Unassigned Area</strong><br/>
+             ${displayName}<br/>
+             <em style="color:#6b7280;font-size:0.75em">Not covered — right-click to add facility here</em>`;
+
+        const popup = new maplibregl.Popup({ offset: 8 }).setHTML(popupHtml);
+        el.addEventListener("contextmenu", (e) => openAreaMenu(e, census_area_id));
+
+        markersRef.current.push(
+          new maplibregl.Marker({ element: el, anchor: "center" })
+            .setLngLat([x, y]).setPopup(popup).addTo(map)
+        );
+      });
+
+      // 4. Existing facilities from infrastructure DB (orange).
       existingFacilities.forEach((fac) => {
         if (!fac.x || !fac.y) return;
         const el = document.createElement("div");
@@ -572,14 +636,14 @@ export default function MapView({
         if (!isRemoved) bounds.extend([facility.x, facility.y]);
       });
 
-      if (!bounds.isEmpty()) {
+      if (!bounds.isEmpty() && wasEmpty) {
         map.fitBounds(bounds, { padding: 60, maxZoom: 12 });
       }
     };
 
     if (map.isStyleLoaded()) render();
     else map.once("load", render);
-  }, [facilities, existingFacilities, removedFacilityIds, addedFacilityAreaIds]);
+  }, [facilities, existingFacilities, unassignedAreas, removedFacilityIds, addedFacilityAreaIds]);
 
   // ── Helpers ────────────────────────────────────────────────────────
   const toggleLayer = (id) =>

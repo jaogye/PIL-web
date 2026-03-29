@@ -18,6 +18,7 @@ class ModelType(str, enum.Enum):
     P_MEDIAN = "p_median"
     P_CENTER = "p_center"
     MAX_COVERAGE = "max_coverage"
+    BUMP_HUNTER = "bump_hunter"
 
 
 class ScenarioStatus(str, enum.Enum):

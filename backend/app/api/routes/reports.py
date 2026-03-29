@@ -78,6 +78,11 @@ async def export_scenario_excel(
     if scenario.result_stats:
         ws_summary.append(["── Statistics ──"])
         for key, value in scenario.result_stats.items():
+            if key.startswith("_"):
+                continue  # skip internal keys (_meta, _locations, etc.)
+            # Ensure value is a scalar that openpyxl can handle.
+            if not isinstance(value, (int, float, str, bool, type(None))):
+                value = str(value)
             ws_summary.append([key.replace("_", " ").title(), value])
 
     ws_summary.column_dimensions["A"].width = 30

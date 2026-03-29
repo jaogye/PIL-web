@@ -10,7 +10,7 @@
 
 import { useState, useEffect, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { optimizationApi, reportsApi } from "../../services/api";
+import { optimizationApi, reportsApi, targetPopulationsApi } from "../../services/api";
 import PoliticalDivisionTree from "./PoliticalDivisionTree";
 
 // ─── localStorage helpers ────────────────────────────────────────────────────
@@ -86,6 +86,7 @@ const MODEL_OPTIONS = [
   { value: "p_median",     label: "P-Median",          description: "Minimise total weighted travel time (efficiency)." },
   { value: "p_center",     label: "P-Center",          description: "Minimise the maximum travel time (equity)." },
   { value: "max_coverage", label: "Maximum Coverage",  description: "Maximise population covered within a service radius." },
+  { value: "bump_hunter",  label: "Bump Hunter",       description: "Find census areas that are local demand-density peaks — candidate facility sites." },
 ];
 
 const FACILITY_TYPE_OPTIONS = [
@@ -93,6 +94,7 @@ const FACILITY_TYPE_OPTIONS = [
   { value: "high_school",   label: "High School" },
   { value: "health_center", label: "Health Center" },
   { value: "hospital",      label: "Hospital" },
+  { value: "nursery",       label: "Nursery (Guardería)" },
   { value: "other",         label: "Other" },
 ];
 
@@ -102,14 +104,17 @@ export default function OptimizationPanel({ onResultsReady, onRebalancingResult,
   const queryClient = useQueryClient();
 
   const [form, setForm] = useState({
-    name:          "",
-    model_type:    "p_median",
-    p_facilities:  5,
-    service_radius: 30,
-    mode:          "from_scratch",
-    facility_type: "high_school",
-    min_capacity:  "",
-    max_capacity:  "",
+    name:                 "",
+    model_type:           "p_median",
+    p_facilities:         5,
+    service_radius:       30,
+    mode:                 "from_scratch",
+    facility_type:        "high_school",
+    target_population_id: null,
+    min_capacity:         "",
+    max_capacity:         "",
+    k_neighbors:          "10",   // bump_hunter neighbourhood size for local-maxima detection
+    k_vec:                "100",  // bump_hunter neighbours used in gravity score
   });
 
   const [scopeFilters, setScopeFilters]     = useState(null);
@@ -219,6 +224,27 @@ export default function OptimizationPanel({ onResultsReady, onRebalancingResult,
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // ── Target populations & facility type defaults ──
+  const { data: targetPopulations = [] } = useQuery({
+    queryKey: ["target-populations"],
+    queryFn: targetPopulationsApi.list,
+    staleTime: Infinity,
+  });
+  const { data: facilityTypesData = [] } = useQuery({
+    queryKey: ["facility-types"],
+    queryFn: targetPopulationsApi.facilityTypes,
+    staleTime: Infinity,
+  });
+
+  // When facility type changes, auto-set the default target population.
+  useEffect(() => {
+    const ft = facilityTypesData.find((f) => f.code === form.facility_type);
+    if (ft) {
+      setForm((prev) => ({ ...prev, target_population_id: ft.default_target_population_id }));
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.facility_type, facilityTypesData]);
+
   // ── Scenarios list ──
   const { data: scenarios = [] } = useQuery({
     queryKey: ["scenarios"],
@@ -229,18 +255,41 @@ export default function OptimizationPanel({ onResultsReady, onRebalancingResult,
   // ── Submit ──
   const handleSubmit = async (e) => {
     e.preventDefault();
-    const payload = { ...form, p_facilities: Number(form.p_facilities) };
-    if (form.model_type === "max_coverage") {
+    const isBumpHunter = form.model_type === "bump_hunter";
+    const payload = { ...form };
+    // These fields are not top-level API fields — remove them before sending.
+    delete payload.k_neighbors;
+    delete payload.k_vec;
+
+    if (isBumpHunter) {
+      // Bump hunter has no p_facilities.
+      delete payload.p_facilities;
+      delete payload.min_capacity;
+      delete payload.max_capacity;
+      // service_radius is required for bump hunter.
       payload.service_radius = Number(form.service_radius);
+      // Pack bump-hunter-specific params.
+      payload.parameters = {
+        k_neighbors: form.k_neighbors !== "" ? Number(form.k_neighbors) : 10,
+        k_vec:       form.k_vec       !== "" ? Number(form.k_vec)       : 100,
+      };
     } else {
-      delete payload.service_radius;
+      payload.p_facilities = Number(form.p_facilities);
+      if (form.model_type === "max_coverage") {
+        payload.service_radius = Number(form.service_radius);
+      } else {
+        delete payload.service_radius;
+      }
+      if (form.min_capacity !== "") payload.min_capacity = Number(form.min_capacity);
+      else delete payload.min_capacity;
+      if (form.max_capacity !== "") payload.max_capacity = Number(form.max_capacity);
+      else delete payload.max_capacity;
     }
+
     if (scopeFilters) payload.scope_filters = scopeFilters;
-    if (form.mode !== "complete_existing") delete payload.facility_type;
-    if (form.min_capacity !== "") payload.min_capacity = Number(form.min_capacity);
-    else delete payload.min_capacity;
-    if (form.max_capacity !== "") payload.max_capacity = Number(form.max_capacity);
-    else delete payload.max_capacity;
+    // Always keep facility_type (used for target population resolution even in from_scratch mode).
+    if (form.target_population_id != null) payload.target_population_id = form.target_population_id;
+    else delete payload.target_population_id;
 
     setRunStatus("running");
     setRunError(null);
@@ -403,36 +452,57 @@ export default function OptimizationPanel({ onResultsReady, onRebalancingResult,
           ))}
         </select>
 
-        <label style={labelStyle}>Planning Mode</label>
-        <select
-          style={inputStyle}
-          value={form.mode}
-          onChange={(e) => setForm({ ...form, mode: e.target.value })}
-        >
-          <option value="from_scratch">From scratch</option>
-          <option value="complete_existing">Complete existing</option>
-        </select>
-        {form.mode === "complete_existing" && (
-          <p style={{ fontSize: "0.78rem", color: "#6b7280", marginBottom: "0.75rem" }}>
-            Existing facilities of the selected type will be fixed.
-          </p>
+        {targetPopulations.length > 0 && (
+          <>
+            <label style={labelStyle}>Target Population</label>
+            <select
+              style={inputStyle}
+              value={form.target_population_id ?? ""}
+              onChange={(e) =>
+                setForm({ ...form, target_population_id: e.target.value ? Number(e.target.value) : null })
+              }
+            >
+              {targetPopulations.map((tp) => (
+                <option key={tp.id} value={tp.id}>{tp.label}</option>
+              ))}
+            </select>
+          </>
         )}
 
-        {/* p (p-median / p-center only) */}
-        {form.model_type !== "max_coverage" && (
+        {form.model_type !== "bump_hunter" && (
+          <>
+            <label style={labelStyle}>Planning Mode</label>
+            <select
+              style={inputStyle}
+              value={form.mode}
+              onChange={(e) => setForm({ ...form, mode: e.target.value })}
+            >
+              <option value="from_scratch">From scratch</option>
+              <option value="complete_existing">Complete existing</option>
+            </select>
+            {form.mode === "complete_existing" && (
+              <p style={{ fontSize: "0.78rem", color: "#6b7280", marginBottom: "0.75rem" }}>
+                Existing facilities of the selected type will be fixed.
+              </p>
+            )}
+          </>
+        )}
+
+        {/* p (p-median / p-center / max_coverage — not bump_hunter) */}
+        {form.model_type !== "bump_hunter" && (
           <>
             <label style={labelStyle}>Number of Facilities (p)</label>
             <input
               style={inputStyle}
-              type="number" min={1} max={200}
+              type="number" min={1} max={500}
               value={form.p_facilities}
               onChange={(e) => setForm({ ...form, p_facilities: e.target.value })}
             />
           </>
         )}
 
-        {/* service radius (max_coverage only) */}
-        {form.model_type === "max_coverage" && (
+        {/* service radius (max_coverage and bump_hunter) */}
+        {(form.model_type === "max_coverage" || form.model_type === "bump_hunter") && (
           <>
             <label style={labelStyle}>Service Radius (minutes)</label>
             <input
@@ -444,36 +514,68 @@ export default function OptimizationPanel({ onResultsReady, onRebalancingResult,
           </>
         )}
 
-        {/* Capacity controls – one row */}
-        <div style={{ display: "flex", gap: "0.5rem" }}>
-          <div style={{ flex: 1 }}>
-            <label style={labelStyle}>Min Capacity</label>
+        {/* bump_hunter parameters */}
+        {form.model_type === "bump_hunter" && (
+          <>
+            <label style={labelStyle}>Neighbourhood Size (k)</label>
             <input
               style={inputStyle}
-              type="number" min={0}
-              value={form.min_capacity}
-              placeholder="None"
-              onChange={(e) => setForm({ ...form, min_capacity: e.target.value })}
+              type="number" min={1} max={500}
+              value={form.k_neighbors}
+              placeholder="10"
+              onChange={(e) => setForm({ ...form, k_neighbors: e.target.value })}
             />
-          </div>
-          <div style={{ flex: 1 }}>
-            <label style={labelStyle}>Max Capacity</label>
+            <label style={labelStyle}>Momentum Neighbours (k_vec)</label>
             <input
               style={inputStyle}
-              type="number" min={0}
-              value={form.max_capacity}
-              placeholder="∞"
-              onChange={(e) => setForm({ ...form, max_capacity: e.target.value })}
+              type="number" min={1} max={5000}
+              value={form.k_vec}
+              placeholder="100"
+              onChange={(e) => setForm({ ...form, k_vec: e.target.value })}
             />
+          </>
+        )}
+
+        {/* Capacity controls – hidden for bump_hunter */}
+        {form.model_type !== "bump_hunter" && (
+          <div style={{ display: "flex", gap: "0.5rem" }}>
+            <div style={{ flex: 1 }}>
+              <label style={labelStyle}>Min Capacity</label>
+              <input
+                style={inputStyle}
+                type="number" min={0}
+                value={form.min_capacity}
+                placeholder="None"
+                onChange={(e) => setForm({ ...form, min_capacity: e.target.value })}
+              />
+            </div>
+            <div style={{ flex: 1 }}>
+              <label style={labelStyle}>Max Capacity</label>
+              <input
+                style={inputStyle}
+                type="number" min={0}
+                value={form.max_capacity}
+                placeholder="∞"
+                onChange={(e) => setForm({ ...form, max_capacity: e.target.value })}
+              />
+            </div>
           </div>
-        </div>
+        )}
 
         {/* Geographic Scope */}
         <label style={labelStyle}>Geographic Scope</label>
         <p style={{ fontSize: "0.75rem", color: "#6b7280", marginBottom: "0.4rem" }}>
           No selection uses all census areas.
         </p>
-        <PoliticalDivisionTree onChange={handleScopeChange} selectedDb={selectedDb} />
+        <PoliticalDivisionTree
+          onChange={handleScopeChange}
+          selectedDb={selectedDb}
+          targetPopulationId={form.target_population_id}
+          targetPopulationLabel={
+            targetPopulations.find((tp) => tp.id === form.target_population_id)?.label
+            ?? "Target population"
+          }
+        />
 
         {/* Scenario Name */}
         <label style={{ ...labelStyle, marginTop: "0.75rem", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -577,7 +679,7 @@ export default function OptimizationPanel({ onResultsReady, onRebalancingResult,
       )}
 
       {/* ── Rebalancing section ── */}
-      {activeScenarioData?.scenario_id && (
+      {activeScenarioData?.scenario_id && activeScenarioData?.model_type !== "bump_hunter" && (
         <div style={rebalSectionStyle}>
           <button
             type="button"

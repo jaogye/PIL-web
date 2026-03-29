@@ -19,6 +19,7 @@ class FacilityType(str, enum.Enum):
     HIGH_SCHOOL = "high_school"
     HEALTH_CENTER = "health_center"
     HOSPITAL = "hospital"
+    NURSERY = "nursery"
     OTHER = "other"
 
 
@@ -66,3 +67,18 @@ class Facility(Base):
 
     def __repr__(self) -> str:
         return f"<Facility id={self.id} type={self.facility_type} status={self.status}>"
+
+
+class FacilityTypeLookup(Base):
+    """ORM representation of the facility_types lookup table."""
+
+    __tablename__ = "facility_types"
+
+    code:                         Mapped[str]        = mapped_column(String(50), primary_key=True)
+    label:                        Mapped[str]        = mapped_column(String(255), nullable=False)
+    default_target_population_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("target_population.id"), nullable=True
+    )
+
+    def __repr__(self) -> str:
+        return f"<FacilityTypeLookup code={self.code}>"

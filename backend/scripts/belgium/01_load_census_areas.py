@@ -375,26 +375,56 @@ def insert_census_areas(cur, gdf: gpd.GeoDataFrame,
         ))
 
     if missing_pop:
-        log.warning("  %d sectors had no population data (demand=0)", missing_pop)
+        log.warning("  %d sectors had no population data (population=0)", missing_pop)
 
     BATCH = 2000
     for i in range(0, len(rows), BATCH):
         execute_values(cur, """
             INSERT INTO census_areas
                 (area_code, name, province_code, canton_code, parish_code,
-                 demand, capacity,
+                 capacity,
                  geom, x, y, parish_id)
             VALUES %s
             ON CONFLICT (area_code) DO UPDATE SET
-                demand    = EXCLUDED.demand,
                 parish_id = EXCLUDED.parish_id
         """, [
             (r[0], r[1], r[2], r[3], r[4],
-             r[5], r[6],
-             r[7], r[8], r[9], r[10])      # r[7] is WKT string
+             r[6],
+             r[7], r[8], r[9], r[10])      # r[7] is WKT string; r[5]=total pop handled below
             for r in rows[i:i+BATCH]
-        ], template="(%s,%s,%s,%s,%s,%s,%s,ST_GeomFromText(%s,4326),%s,%s,%s)")
+        ], template="(%s,%s,%s,%s,%s,%s,ST_GeomFromText(%s,4326),%s,%s,%s)")
     log.info("  Inserted %d census areas", len(rows))
+
+    # Insert total population into census_areas_population (all_ages group).
+    cur.execute("SELECT id FROM target_population WHERE code = 'all_ages'")
+    tp_row = cur.fetchone()
+    if tp_row:
+        tp_id = tp_row[0]
+        area_codes = [r[0] for r in rows]
+        cur.execute(
+            "SELECT area_code, id FROM census_areas WHERE area_code = ANY(%s)",
+            (area_codes,),
+        )
+        area_id_map = {row[0]: row[1] for row in cur.fetchall()}
+        pop_rows = [
+            (area_id_map[r[0]], tp_id, r[5])
+            for r in rows
+            if r[0] in area_id_map
+        ]
+        if pop_rows:
+            execute_values(
+                cur,
+                """
+                INSERT INTO census_areas_population (census_area_id, target_population_id, population)
+                VALUES %s
+                ON CONFLICT (census_area_id, target_population_id)
+                DO UPDATE SET population = EXCLUDED.population
+                """,
+                pop_rows,
+            )
+            log.info("  Inserted %d all_ages population rows", len(pop_rows))
+    else:
+        log.warning("  target_population 'all_ages' not found — skipping census_areas_population insert")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -477,9 +507,15 @@ def main():
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM political_division")
             n_div = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*), SUM(demand) FROM census_areas")
-            n_ca, total_dem = cur.fetchone()
-        log.info("Done.  political_division=%d  census_areas=%d  total_demand=%.0f",
+            cur.execute("SELECT COUNT(*) FROM census_areas")
+            n_ca = cur.fetchone()[0]
+            cur.execute(
+                "SELECT COALESCE(SUM(population), 0) FROM census_areas_population cap "
+                "JOIN target_population tp ON tp.id = cap.target_population_id "
+                "WHERE tp.code = 'all_ages'"
+            )
+            total_dem = cur.fetchone()[0]
+        log.info("Done.  political_division=%d  census_areas=%d  total_population=%.0f",
                  n_div, n_ca, total_dem or 0)
 
     except Exception:

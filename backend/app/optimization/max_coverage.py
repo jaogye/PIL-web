@@ -1,20 +1,24 @@
 """
-Capacitated Maximum Coverage Location Problem (CMCLP).
+Capacitated Maximum Coverage Location Problem with Closest Assignment Constraints
+(CMCLP-CAC) — GRASP heuristic.
 
-Objective: maximise total demand served by placing as many facilities as needed,
-subject to:
-  - Each facility serves demand only from areas within the service radius.
-  - Each facility serves at most cap_max demand (nearest areas take priority).
-  - Overflow beyond cap_max is redirected to the nearest other facility
-    within radius that still has remaining capacity.
-  - A facility is only placed if it can attract at least cap_min demand
-    from currently unassigned demand within its zone.
-  - Facilities are added greedily until no candidate can attract >= cap_min.
+Reference: Slot, A. "Capacitated Maximum Covering Location Problem with Closest
+Assignment Constraints", Tilburg University.
 
-Algorithm: Greedy Add with capacity-aware marginal gain.
-  Each step uses marginal_coverage() — O(nnz) — to find the best candidate,
-  then assigns demand via vectorised numpy (nearest-first within zone).
-  Overflow redistribution uses CSR rows, O(k) per overflowed area.
+Algorithm:
+  Phase 0  Pre-existing facilities: fixed open.
+  Phase 1  GRASP construction (_N_GRASP_ITER independent runs, best kept):
+           Proportional greedy with exponential bias α=0.05 (pgreedy_exp).
+           At each step, each closed candidate j is scored by the uncovered
+           demand within its service radius (stored pairs); candidates are
+           ranked descending and selected with probability ∝ exp(−α · rank).
+           Exactly p − |pre_selected| new facilities are placed per run.
+  Phase 2  First Improvement local search per GRASP run:
+           For each open non-fixed facility fl, a neighbourhood of closed
+           candidates fe is built from stored neighbors of areas in fl's zone.
+           The top _LS_CANDIDATES (by uncovered marginal gain) are evaluated
+           via full CAC re-assignment.  The first improving swap is accepted
+           and the search restarts.  Terminates when no improvement is found.
 """
 
 from __future__ import annotations
@@ -28,6 +32,11 @@ from .sparse_matrix import MAX_DIST, SparseDistanceMatrix
 
 logger = logging.getLogger(__name__)
 
+_ALPHA = 0.05         # pgreedy_exp exponential bias parameter
+_N_GRASP_ITER = 5     # independent GRASP runs (construction + LS); best kept
+_MAX_LS_ROUNDS = 20   # maximum LS passes per run
+_LS_CANDIDATES = 25   # closed-facility candidates to evaluate per open facility
+
 
 @dataclass
 class MaxCoverageResult:
@@ -39,217 +48,363 @@ class MaxCoverageResult:
     coverage_stats: dict = field(default_factory=dict)
 
 
+# ─────────────────────────────────────────────────────────────────────────── #
+# Public API                                                                    #
+# ─────────────────────────────────────────────────────────────────────────── #
+
 def solve(
     distance_matrix: SparseDistanceMatrix,
     demand: np.ndarray,
-    p: int,                         # kept for API compatibility; ignored
+    p: int,
     radius: float,
     cap_min: float = 0.0,
     cap_max: float | None = None,
     pre_selected: list[int] | None = None,
+    **kwargs,
 ) -> MaxCoverageResult:
     """
-    Solve the Capacitated MCLP.
+    Solve CMCLP-CAC via GRASP (pgreedy_exp construction + First Improvement LS).
 
     Parameters
     ----------
     distance_matrix : SparseDistanceMatrix
-    demand          : np.ndarray, shape (n,)
-    p               : int — ignored; facilities are placed until cap_min
-                      cannot be satisfied, not until a fixed count is reached.
-    radius          : float — service radius in minutes.
-    cap_min         : float — minimum demand a facility must attract to be placed.
-    cap_max         : float | None — maximum demand a facility can serve (None = ∞).
-    pre_selected    : list[int] | None — indices fixed as existing facilities.
+    demand          : (n,) float64
+    p               : total facilities to open (pre_selected count toward p)
+    radius          : service radius in minutes
+    cap_min         : minimum demand a facility must attract (else it is dropped)
+    cap_max         : maximum demand per facility (None = uncapacitated)
+    pre_selected    : fixed existing facility indices
     """
     dm = distance_matrix
     n = dm.n
+    r16 = np.uint16(min(int(radius), MAX_DIST))
     cap_max_f = float(cap_max) if cap_max is not None else math.inf
     cap_min_f = float(cap_min)
     total_demand = float(np.sum(demand))
-    pre_selected = list(pre_selected or [])
+    pre_sel = list(pre_selected or [])
+    demand_f = demand.astype(np.float64)
 
-    remaining: np.ndarray = demand.astype(np.float64).copy()
-    selected: list[int] = []
-    selected_set: set[int] = set()
-    fac_load: dict[int, float] = {}      # total demand assigned to each facility
-    fac_remaining: dict[int, float] = {} # remaining capacity of each facility
+    rng = np.random.default_rng()
+    p_new = max(0, p - len(pre_sel))
+    n_iters = _N_GRASP_ITER if p_new > 0 else 1
 
-    # ── Pre-selected (existing) facilities ─────────────────────────────── #
-    for fac in pre_selected:
-        selected.append(fac)
-        selected_set.add(fac)
-        fac_load[fac] = 0.0
-        fac_remaining[fac] = cap_max_f
+    # Precompute zones once: sorted (rows, dists) within radius for every facility.
+    # Avoids repeated O(n) col_neighbors_full calls inside the hot LS loop.
+    zones = _precompute_zones(dm, n, radius)
 
-    if pre_selected:
-        for fac in pre_selected:
-            _assign_zone(dm, remaining, fac, fac_load, fac_remaining,
-                         radius, selected_set)
+    best_covered = -1.0
+    best_opened: list[int] = []
 
-    # ── Phase 1: Greedy Add ─────────────────────────────────────────────── #
-    while True:
-        # O(nnz): for each candidate j, sum of remaining demand in its zone.
-        raw_gain = dm.marginal_coverage(remaining, radius)
-
-        # Cap at max capacity (upper bound on what the best candidate can absorb).
-        effective_gain = np.minimum(raw_gain, cap_max_f) if cap_max is not None else raw_gain
-
-        # Exclude already-selected facilities.
-        if selected_set:
-            effective_gain[list(selected_set)] = -1.0
-
-        best = int(np.argmax(effective_gain))
-
-        if effective_gain[best] < cap_min_f - 1e-9:
-            break  # No candidate can attract enough unassigned demand.
-
-        # Place facility at best.
-        selected.append(best)
-        selected_set.add(best)
-        fac_load[best] = 0.0
-        fac_remaining[best] = cap_max_f
-
-        _assign_zone(dm, remaining, best, fac_load, fac_remaining,
-                     radius, selected_set)
-
-    # ── Remove facilities below cap_min (defensive check) ──────────────── #
-    valid = [f for f in selected if fac_load.get(f, 0.0) >= cap_min_f - 1e-9]
-    if len(valid) < len(selected):
-        logger.warning(
-            "  CMCLP: dropped %d facilities below cap_min after placement",
-            len(selected) - len(valid),
+    for iteration in range(n_iters):
+        opened = _pgreedy_exp_construction(
+            dm, demand_f, p_new, radius, r16, zones, pre_sel, _ALPHA, rng
         )
-    selected = valid
+        opened, cov_dem = _first_improvement_ls(
+            dm, demand_f, opened, radius, r16, zones, pre_sel, cap_max_f
+        )
+        logger.debug(
+            "GRASP iter %d: %d facilities, covered=%.1f", iteration, len(opened), cov_dem
+        )
+        if cov_dem > best_covered:
+            best_covered = cov_dem
+            best_opened = opened[:]
 
-    # ── Coverage & assignment ──────────────────────────────────────────── #
-    # An area is "covered" if any of its demand was assigned to a facility.
-    # Since we only assign within radius, remaining[i] < demand[i] iff covered.
-    covered = remaining < demand - 1e-9
-
-    covered_dem = float(np.sum(demand[covered]))
-    coverage_pct = (
-        round(covered_dem / total_demand * 100, 2) if total_demand > 0 else 0.0
+    # Final assignment with best solution
+    covered_demand, fac_load, covered_mask, nearest_fac = _cac_assignment(
+        demand_f, best_opened, zones, cap_max_f
     )
 
-    # Nearest-facility assignment array (used by the route for visualization).
-    assignment = dm.assign(selected) if selected else [-1] * n
+    # Drop facilities below cap_min
+    valid_opened = [j for j in best_opened if fac_load.get(j, 0.0) >= cap_min_f - 1e-9]
+    if len(valid_opened) < len(best_opened):
+        logger.warning(
+            "CMCLP: dropped %d facilities below cap_min", len(best_opened) - len(valid_opened)
+        )
+        covered_demand, fac_load, covered_mask, nearest_fac = _cac_assignment(
+            demand_f, valid_opened, zones, cap_max_f
+        )
+
+    coverage_pct = round(covered_demand / total_demand * 100, 2) if total_demand > 0 else 0.0
+    assignment = np.where(covered_mask, nearest_fac, np.int32(-1)).tolist()
+
+    logger.info(
+        "CMCLP GRASP: %d facilities, covered=%.1f/%.1f (%.1f%%)",
+        len(valid_opened), covered_demand, total_demand, coverage_pct,
+    )
 
     return MaxCoverageResult(
-        facility_indices=sorted(selected),
+        facility_indices=sorted(valid_opened),
         assignment=assignment,
-        covered_demand=covered_dem,
+        covered_demand=covered_demand,
         total_demand=total_demand,
         coverage_pct=coverage_pct,
         coverage_stats=_compute_stats(
-            demand, dm, selected, radius, covered, fac_load, cap_min_f, cap_max_f
+            demand_f, dm, valid_opened, radius, covered_mask, fac_load, cap_min_f, cap_max_f
         ),
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
-# Demand-assignment helpers                                                     #
+# Zone precomputation                                                           #
 # ─────────────────────────────────────────────────────────────────────────── #
 
-def _assign_zone(
+def _precompute_zones(
     dm: SparseDistanceMatrix,
-    remaining: np.ndarray,
-    fac: int,
-    fac_load: dict[int, float],
-    fac_remaining: dict[int, float],
+    n: int,
     radius: float,
-    selected_set: set[int],
-) -> None:
+) -> list[tuple[np.ndarray, np.ndarray]]:
     """
-    Assign demand from fac's zone to fac (nearest-first, up to cap_max).
-
-    Demand that exceeds fac's capacity (overflow) is redirected to other
-    selected facilities within radius that still have remaining capacity,
-    sorted by their distance to each overflowed area.
+    For each facility j, compute (rows, dists) for all areas within radius
+    (stored + estimated pairs), sorted by distance ascending.  Called once.
     """
-    rows, vals = dm.col_neighbors(fac)
-    r16 = np.uint16(min(int(radius), MAX_DIST))
-    in_zone = vals <= r16
+    zones: list[tuple[np.ndarray, np.ndarray]] = []
+    for j in range(n):
+        rows, dists = dm.col_neighbors_full(j, radius)
+        if len(rows) > 0:
+            order = np.argsort(dists, kind="stable")
+            zones.append((rows[order], dists[order]))
+        else:
+            zones.append((np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float64)))
+    return zones
 
-    if not np.any(in_zone):
-        return
 
-    zone_rows = rows[in_zone]
-    zone_vals = vals[in_zone]
+# ─────────────────────────────────────────────────────────────────────────── #
+# CAC assignment                                                               #
+# ─────────────────────────────────────────────────────────────────────────── #
 
-    # Sort zone areas nearest-first so they get capacity priority.
-    order = np.argsort(zone_vals, kind="stable")
-    zone_rows = zone_rows[order]
+def _cac_assignment(
+    demand: np.ndarray,
+    opened_list: list[int],
+    zones: list[tuple[np.ndarray, np.ndarray]],
+    cap_max_f: float,
+) -> tuple[float, dict[int, float], np.ndarray, np.ndarray]:
+    """
+    Closest Assignment Constraint assignment with capacity.
 
-    cap = fac_remaining[fac]
-    avail = remaining[zone_rows]  # unassigned demand in each zone area
+    Each area is assigned to its nearest open facility within radius.
+    Fills the facility nearest-first up to cap_max_f; areas beyond capacity
+    are uncovered.
 
-    if cap == math.inf:
-        # No limit: assign all available demand in zone.
-        assigned = float(np.sum(avail))
-        remaining[zone_rows] -= avail
-        fac_load[fac] += assigned
-        return
+    Returns
+    -------
+    covered_demand : float
+    fac_load       : dict[int, float]
+    covered_mask   : (n,) bool
+    nearest_fac    : (n,) int32 — nearest open facility index (-1 if none in radius)
+    """
+    n = len(demand)
+    nearest_dist = np.full(n, float(MAX_DIST))
+    nearest_fac = np.full(n, -1, dtype=np.int32)
 
-    if cap <= 1e-9:
-        # Facility already full; everything is overflow.
-        overflow_start = 0
-    else:
-        cumsum = np.cumsum(avail)
-        if cumsum[-1] <= cap:
-            # All zone demand fits within capacity.
-            remaining[zone_rows] -= avail
-            fac_load[fac] += float(cumsum[-1])
-            fac_remaining[fac] -= float(cumsum[-1])
-            return
-
-        # Find the cutoff: areas 0..k-1 are fully taken; area k is partial.
-        # searchsorted 'right': cumsum[k-1] <= cap < cumsum[k]
-        k = int(np.searchsorted(cumsum, cap, side="right"))
-        take = np.zeros(len(avail), dtype=np.float64)
-        if k > 0:
-            take[:k] = avail[:k]
-        partial = cap - (float(cumsum[k - 1]) if k > 0 else 0.0)
-        if k < len(avail) and partial > 1e-9:
-            take[k] = partial
-
-        remaining[zone_rows] -= take
-        fac_load[fac] += float(np.sum(take))
-        fac_remaining[fac] = 0.0
-        overflow_start = k  # area k still has (avail[k] - partial) remaining
-
-    # ── Overflow redistribution ─────────────────────────────────────────── #
-    # For each overflowed area, redirect remaining demand to the nearest other
-    # selected facility within radius that has available capacity.
-    for i in zone_rows[overflow_start:].tolist():
-        if remaining[i] <= 1e-9:
+    for j in opened_list:
+        rows, dists = zones[j]
+        if len(rows) == 0:
             continue
+        better = dists < nearest_dist[rows]
+        nearest_dist[rows[better]] = dists[better]
+        nearest_fac[rows[better]] = j
 
-        s = int(dm.csr_ptr[i])
-        e = int(dm.csr_ptr[i + 1])
-        nbrs = dm.csr_col[s:e]
-        dsts = dm.csr_val[s:e]
+    # Group areas by nearest facility using argsort to avoid per-facility n-scan
+    valid_areas = np.where(nearest_fac >= 0)[0]
+    if len(valid_areas) == 0:
+        return 0.0, {j: 0.0 for j in opened_list}, np.zeros(n, dtype=bool), nearest_fac
 
-        # Candidate facilities: selected, within radius, with capacity, != fac.
-        candidates = sorted(
-            (int(dsts[k]), int(nbrs[k]))
-            for k in range(len(nbrs))
-            if int(nbrs[k]) in selected_set
-            and int(nbrs[k]) != fac
-            and dsts[k] <= r16
-        )
+    valid_facs_arr = nearest_fac[valid_areas]
+    sort_order = np.argsort(valid_facs_arr, kind="stable")
+    sorted_areas = valid_areas[sort_order]
+    sorted_facs = valid_facs_arr[sort_order]
 
-        for _, other in candidates:
-            if remaining[i] <= 1e-9:
+    diff = np.diff(sorted_facs)
+    boundaries = np.concatenate([[0], np.where(diff != 0)[0] + 1, [len(sorted_facs)]])
+
+    covered_mask = np.zeros(n, dtype=bool)
+    fac_load: dict[int, float] = {j: 0.0 for j in opened_list}
+    covered_demand = 0.0
+
+    for k in range(len(boundaries) - 1):
+        start, end = int(boundaries[k]), int(boundaries[k + 1])
+        j = int(sorted_facs[start])
+        idx = sorted_areas[start:end]
+        dists_j = nearest_dist[idx]
+        demands_j = demand[idx]
+
+        # Sort within facility by distance (CAC: nearest-first fill)
+        inner_order = np.argsort(dists_j, kind="stable")
+        sorted_demands = demands_j[inner_order]
+
+        if cap_max_f == math.inf:
+            covered_mask[idx] = True
+            load = float(np.sum(sorted_demands))
+        else:
+            cumsum = np.cumsum(sorted_demands)
+            kk = int(np.searchsorted(cumsum, cap_max_f + 1e-9, side="left"))
+            if kk > 0:
+                covered_mask[idx[inner_order[:kk]]] = True
+                load = float(cumsum[kk - 1])
+            else:
+                load = 0.0
+
+        fac_load[j] = load
+        covered_demand += load
+
+    return covered_demand, fac_load, covered_mask, nearest_fac
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
+# GRASP construction — pgreedy_exp                                             #
+# ─────────────────────────────────────────────────────────────────────────── #
+
+def _pgreedy_exp_construction(
+    dm: SparseDistanceMatrix,
+    demand: np.ndarray,
+    p_new: int,
+    radius: float,
+    r16: np.uint16,
+    zones: list[tuple[np.ndarray, np.ndarray]],
+    pre_sel: list[int],
+    alpha: float,
+    rng: np.random.Generator,
+) -> list[int]:
+    """
+    Proportional greedy construction with exponential bias (pgreedy_exp).
+
+    At each step, marginal demand coverage is computed for all closed
+    candidates using the stored-pairs-only marginal_coverage (O(nnz), vectorised).
+    Candidates are ranked by score descending, then one is selected with
+    probability ∝ exp(−α · rank).  nearest_dist is maintained incrementally.
+    """
+    n = len(demand)
+    opened = list(pre_sel)
+    opened_set = set(opened)
+
+    nearest_dist = np.full(n, float(MAX_DIST))
+    for j in pre_sel:
+        rows, dists = zones[j]
+        if len(rows):
+            better = dists < nearest_dist[rows]
+            nearest_dist[rows[better]] = dists[better]
+
+    for _ in range(p_new):
+        uncov = np.where(nearest_dist <= radius, 0.0, demand)
+        gains = dm.marginal_coverage(uncov, radius)
+        if opened_set:
+            gains[list(opened_set)] = 0.0
+
+        nonzero = np.where(gains > 1e-9)[0]
+        if len(nonzero) == 0:
+            remaining = [j for j in range(n) if j not in opened_set]
+            if not remaining:
                 break
-            cap_o = fac_remaining[other]
-            if cap_o <= 1e-9:
+            chosen = remaining[int(rng.integers(0, len(remaining)))]
+        else:
+            order = np.argsort(-gains[nonzero])
+            ranked = nonzero[order]
+            scores = np.exp(-alpha * np.arange(len(ranked), dtype=np.float64))
+            scores /= scores.sum()
+            chosen = int(ranked[int(rng.choice(len(ranked), p=scores))])
+
+        opened.append(chosen)
+        opened_set.add(chosen)
+
+        rows, dists = zones[chosen]
+        if len(rows):
+            better = dists < nearest_dist[rows]
+            nearest_dist[rows[better]] = dists[better]
+
+    return opened
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
+# First Improvement local search                                               #
+# ─────────────────────────────────────────────────────────────────────────── #
+
+def _first_improvement_ls(
+    dm: SparseDistanceMatrix,
+    demand: np.ndarray,
+    opened: list[int],
+    radius: float,
+    r16: np.uint16,
+    zones: list[tuple[np.ndarray, np.ndarray]],
+    pre_sel: list[int],
+    cap_max_f: float,
+) -> tuple[list[int], float]:
+    """
+    First Improvement local search over (fl, fe) swap pairs.
+
+    For each open non-pre-selected facility fl, a neighbourhood of closed
+    candidates fe is built from the stored neighbors of areas in fl's zone.
+    The top _LS_CANDIDATES (scored by uncovered marginal gain) are evaluated
+    via full CAC re-assignment.  The first improving swap is accepted and the
+    search restarts.  Stops when no improving swap exists or _MAX_LS_ROUNDS
+    passes have been completed.
+
+    Returns the final opened list and its covered demand.
+    """
+    pre_sel_set = set(pre_sel)
+    opened_set = set(opened)
+
+    current_covered, _, _, _ = _cac_assignment(demand, list(opened_set), zones, cap_max_f)
+
+    for _round in range(_MAX_LS_ROUNDS):
+        improved = False
+
+        # Cache opened_list once per round for repeated use
+        opened_list = sorted(opened_set)
+        opened_arr = np.array(opened_list, dtype=np.int32)
+
+        # Uncovered marginal gains for candidate scoring (stored pairs, O(nnz))
+        md = dm.min_dist_to_set(opened_list)
+        uncov = np.where(md > r16, demand, 0.0)
+        round_gains = dm.marginal_coverage(uncov, radius)
+        round_gains[opened_list] = 0.0
+
+        for fl in opened_list:
+            if fl in pre_sel_set:
                 continue
-            take = min(remaining[i], cap_o)
-            remaining[i] -= take
-            fac_load[other] += take
-            if cap_o != math.inf:
-                fac_remaining[other] -= take
+
+            rows_fl, _ = zones[fl]
+            if len(rows_fl) == 0:
+                continue
+
+            sample = rows_fl[:20]
+            parts = [dm.csr_col[dm.csr_ptr[i]:dm.csr_ptr[i + 1]] for i in sample]
+            if not parts:
+                continue
+            all_nbrs = np.concatenate(parts)
+            fe_candidates = np.setdiff1d(np.unique(all_nbrs), opened_arr)
+            if len(fe_candidates) == 0:
+                continue
+
+            if len(fe_candidates) > _LS_CANDIDATES:
+                cand_scores = round_gains[fe_candidates]
+                top_k = min(_LS_CANDIDATES, len(fe_candidates))
+                top_idx = np.argpartition(-cand_scores, top_k - 1)[:top_k]
+                fe_candidates = fe_candidates[top_idx]
+
+            base_opened = [j for j in opened_set if j != fl]
+
+            for fe in fe_candidates:
+                new_cov, _, _, _ = _cac_assignment(
+                    demand, base_opened + [int(fe)], zones, cap_max_f
+                )
+                if new_cov > current_covered + 1e-6:
+                    opened_set.discard(fl)
+                    opened_set.add(int(fe))
+                    logger.debug(
+                        "LS: swap fl=%d → fe=%d  coverage %.1f → %.1f",
+                        fl, int(fe), current_covered, new_cov,
+                    )
+                    current_covered = new_cov
+                    improved = True
+                    break
+
+            if improved:
+                break
+
+        if not improved:
+            break
+
+    return list(opened_set), current_covered
 
 
 # ─────────────────────────────────────────────────────────────────────────── #

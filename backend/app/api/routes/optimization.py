@@ -24,7 +24,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_session_factory
 from app.dependencies import get_db, get_db_name
 from app.models.census import CensusArea
-from app.models.facility import Facility, FacilityStatus, FacilityType
+from app.models.facility import Facility, FacilityStatus, FacilityType, FacilityTypeLookup
+from app.models.target_population import CensusAreaPopulation
 from app.optimization.sparse_matrix import MAX_DIST, SparseDistanceMatrix
 from app.models.optimization import (
     ModelType,
@@ -33,6 +34,7 @@ from app.models.optimization import (
     ScenarioStatus,
 )
 from app.optimization import (
+    bump_hunter_solve,
     max_coverage_solve,
     p_center_solve,
     p_median_solve,
@@ -49,9 +51,51 @@ from app.schemas.optimization import (
     RebalancingTransferInfo,
     ScenarioSummary,
     ServedAreaInfo,
+    UnassignedAreaInfo,
 )
 
 router = APIRouter(prefix="/optimization", tags=["optimization"])
+
+
+async def _load_demand(
+    db: AsyncSession,
+    areas: list[CensusArea],
+    target_population_id: int | None,
+    facility_type_code: str | None,
+) -> np.ndarray:
+    """Return a demand vector aligned with `areas`.
+
+    Resolves the target population in this priority order:
+      1. Explicit target_population_id from the request.
+      2. Default target_population_id for the given facility_type.
+      3. The 'all_ages' group as final fallback.
+    """
+    tp_id = target_population_id
+
+    if tp_id is None and facility_type_code:
+        ft_row = await db.get(FacilityTypeLookup, facility_type_code)
+        if ft_row is not None:
+            tp_id = ft_row.default_target_population_id
+
+    if tp_id is None:
+        # Fallback: use all_ages
+        from app.models.target_population import TargetPopulation
+        tp_result = await db.execute(
+            select(TargetPopulation).where(TargetPopulation.code == "all_ages")
+        )
+        tp = tp_result.scalar_one_or_none()
+        if tp:
+            tp_id = tp.id
+
+    area_ids = [a.id for a in areas]
+    pop_result = await db.execute(
+        select(CensusAreaPopulation).where(
+            CensusAreaPopulation.census_area_id.in_(area_ids),
+            CensusAreaPopulation.target_population_id == tp_id,
+        )
+    )
+    pop_map: dict[int, float] = {r.census_area_id: r.population for r in pop_result.scalars().all()}
+    return np.array([pop_map.get(a.id, 0.0) for a in areas], dtype=np.float64)
 
 
 @router.post("/run", status_code=status.HTTP_202_ACCEPTED)
@@ -65,7 +109,7 @@ async def run_optimization(
         name=payload.name,
         description=payload.description,
         model_type=ModelType(payload.model_type.value),
-        p_facilities=payload.p_facilities,
+        p_facilities=payload.p_facilities if payload.p_facilities is not None else 1,
         service_radius=payload.service_radius,
         scope_filters=payload.scope_filters.model_dump() if payload.scope_filters else None,
         parameters={
@@ -139,6 +183,10 @@ async def get_scenario(scenario_id: int, db: AsyncSession = Depends(get_db)):
             FacilityLocation.model_validate(loc)
             for loc in scenario.result_stats["_locations"]
         ]
+        unassigned = [
+            UnassignedAreaInfo.model_validate(u)
+            for u in scenario.result_stats.get("_unassigned_areas", [])
+        ]
         return OptimizationResponse(
             scenario_id=scenario.id,
             name=scenario.name,
@@ -148,6 +196,7 @@ async def get_scenario(scenario_id: int, db: AsyncSession = Depends(get_db)):
             status=scenario.status.value,
             facility_locations=locations,
             stats=raw_stats,
+            unassigned_areas=unassigned,
         )
 
     # Fallback: reconstruct from DB (pre-async scenarios without _locations).
@@ -225,7 +274,14 @@ async def rebalance_scenario(
         raise HTTPException(status_code=400, detail="No census areas found for this scenario's scope")
 
     area_id_to_idx = {a.id: i for i, a in enumerate(areas)}
-    demand = np.array([a.demand for a in areas], dtype=np.float64)
+
+    # Recover target_population_id stored when the scenario was originally run.
+    _meta = (scenario.result_stats or {}).get("_meta", {})
+    demand = await _load_demand(
+        db, areas,
+        _meta.get("target_population_id"),
+        _meta.get("facility_type"),
+    )
 
     # ── Load (possibly cached) distance matrix ──
     distance_matrix = await _load_distance_matrix(db, [a.id for a in areas])
@@ -348,18 +404,173 @@ async def _run_optimization_bg(
             areas = result.scalars().all()
             _timing["1_load_areas"] = time.perf_counter() - _t0
 
-            if len(areas) < payload.p_facilities:
+            if payload.model_type.value != "bump_hunter" and len(areas) < payload.p_facilities:
                 raise ValueError(
                     f"Not enough census areas ({len(areas)}) for p={payload.p_facilities}"
                 )
 
-            # 2. Build demand vector.
-            demand = np.array([a.demand for a in areas], dtype=np.float64)
+            # 2. Build demand vector from the selected target population.
+            demand = await _load_demand(
+                db, areas, payload.target_population_id, payload.facility_type
+            )
 
-            # 3. Load distance matrix.
+            # 2b. Build coordinate and speed arrays for travel-time estimation.
+            xy = np.array(
+                [(float(a.x or 0.0), float(a.y or 0.0)) for a in areas],
+                dtype=np.float64,
+            )
+            speeds = np.array(
+                [
+                    float(a.avg_speed_kmh) if a.avg_speed_kmh else _FALLBACK_SPEED_KMH
+                    for a in areas
+                ],
+                dtype=np.float64,
+            )
+
+            # 3. Load distance matrix and attach coordinates for full-pair estimation.
             _t = time.perf_counter()
             distance_matrix = await _load_distance_matrix(db, [a.id for a in areas])
+            distance_matrix.xy = xy
+            distance_matrix.speeds = speeds
             _timing["3_load_distance_matrix"] = time.perf_counter() - _t
+
+            # ── BUMP HUNTER (separate flow — no solver dispatch or assignment) ──
+            if payload.model_type.value == "bump_hunter":
+                _t = time.perf_counter()
+                if payload.fixed_census_area_ids is not None:
+                    # Reoptimization: skip solver, use provided facility list.
+                    area_id_to_idx = {a.id: i for i, a in enumerate(areas)}
+                    bump_indices = [
+                        area_id_to_idx[cid]
+                        for cid in payload.fixed_census_area_ids
+                        if cid in area_id_to_idx
+                    ]
+                else:
+                    params = payload.parameters or {}
+                    k_nbrs_param = params.get("k_neighbors")
+                    k_vec_param  = params.get("k_vec")
+                    k_nbrs = int(k_nbrs_param) if k_nbrs_param else None
+                    k_vec  = int(k_vec_param)  if k_vec_param  else 500
+                    bh = await asyncio.to_thread(
+                        bump_hunter_solve,
+                        distance_matrix, demand,
+                        k_neighbors=k_nbrs,
+                        k_vec=k_vec,
+                    )
+                    bump_indices = bh.bump_indices
+                _timing["6_solver"] = time.perf_counter() - _t
+
+                # Assign each area within service_radius to its nearest bump/facility.
+                bh_radius = float(payload.service_radius)
+                area_best: dict[int, tuple[int, float]] = {}  # area_idx → (bump_idx, dist)
+                for bidx in bump_indices:
+                    rows, dists = distance_matrix.col_neighbors_full(bidx, bh_radius)
+                    for row, dist in zip(rows, dists):
+                        row = int(row)
+                        if row not in area_best or float(dist) < area_best[row][1]:
+                            area_best[row] = (bidx, float(dist))
+                    # The facility itself has distance 0.
+                    if bidx not in area_best or 0.0 < area_best[bidx][1]:
+                        area_best[bidx] = (bidx, 0.0)
+
+                bump_to_served: dict[int, list[tuple[int, float]]] = defaultdict(list)
+                for area_idx, (bidx, dist) in area_best.items():
+                    bump_to_served[bidx].append((area_idx, dist))
+
+                # Build location objects with served_areas and computed stats.
+                locations = []
+                covered_ids: set[int] = set()
+                _total_demand_bh = float(np.sum(demand))
+                _total_covered_bh = 0.0
+                _weighted_tt_bh = 0.0
+                _tt_demand_bh = 0.0
+                _global_max_tt_bh = 0.0
+
+                for bidx in bump_indices:
+                    area = areas[bidx]
+                    served_pairs = bump_to_served.get(bidx, [])
+                    served_area_infos = []
+                    covered_dem = 0.0
+                    valid_tts = []
+
+                    for area_idx, dist in served_pairs:
+                        sa = areas[area_idx]
+                        dem = float(demand[area_idx])
+                        covered_dem += dem
+                        _total_covered_bh += dem
+                        covered_ids.add(sa.id)
+                        if dist < MAX_DIST:
+                            valid_tts.append(dist)
+                            _weighted_tt_bh += dem * dist
+                            _tt_demand_bh += dem
+                            if dist > _global_max_tt_bh:
+                                _global_max_tt_bh = dist
+                        if sa.x is not None and sa.y is not None:
+                            served_area_infos.append(
+                                ServedAreaInfo(
+                                    census_area_id=sa.id,
+                                    area_code=sa.area_code,
+                                    x=sa.x,
+                                    y=sa.y,
+                                    assigned_demand=round(dem, 4),
+                                    travel_time=round(dist, 1) if dist < MAX_DIST else None,
+                                )
+                            )
+
+                    max_tt = float(max(valid_tts)) if valid_tts else None
+                    locations.append(FacilityLocation(
+                        census_area_id=area.id,
+                        area_code=area.area_code,
+                        name=area.name,
+                        x=area.x,
+                        y=area.y,
+                        covered_demand=round(covered_dem, 2),
+                        assigned_areas=len(served_pairs),
+                        max_travel_time=max_tt,
+                        is_existing=False,
+                        served_areas=served_area_infos,
+                    ))
+
+                unassigned_areas_bh = [
+                    {"census_area_id": a.id, "area_code": a.area_code,
+                     "name": a.name, "x": a.x, "y": a.y}
+                    for idx, a in enumerate(areas)
+                    if a.id not in covered_ids and float(demand[idx]) > 1e-9
+                ]
+
+                bh_base_stats = bh.stats if payload.fixed_census_area_ids is None else {
+                    "num_bumps": len(bump_indices),
+                    "total_areas": len(areas),
+                    "total_demand": float(np.sum(demand)),
+                }
+                stats = {
+                    **bh_base_stats,
+                    "coverage_pct": round(_total_covered_bh / _total_demand_bh * 100, 2) if _total_demand_bh > 0 else 0.0,
+                    "avg_travel_time_minutes": round(_weighted_tt_bh / _tt_demand_bh, 2) if _tt_demand_bh > 0 else 0.0,
+                    "max_travel_time_minutes": round(_global_max_tt_bh, 2),
+                    "_meta": {
+                        "facility_type": payload.facility_type or "high_school",
+                        "mode": payload.mode.value,
+                        "target_population_id": payload.target_population_id,
+                    },
+                }
+
+                scenario = await db.get(OptimizationScenario, scenario_id)
+                scenario.status = ScenarioStatus.COMPLETED
+                scenario.result_stats = {
+                    **stats,
+                    "_locations": [loc.model_dump() for loc in locations],
+                    "_unassigned_areas": unassigned_areas_bh,
+                }
+                scenario.completed_at = datetime.now(timezone.utc)
+                await db.commit()
+
+                _timing["TOTAL"] = time.perf_counter() - _t0
+                logger.warning(
+                    "BG task completed  scenario=%d  model=bump_hunter  bumps=%d  %.2fs",
+                    scenario_id, len(locations), _timing["TOTAL"],
+                )
+                return
 
             # 4. Resolve pre-selected indices.
             pre_selected: list[int] = []
@@ -418,6 +629,14 @@ async def _run_optimization_bg(
             }
 
             # 8. Capacity-constrained assignment (CPU-bound).
+            # For max_coverage, only assign areas within the service radius so
+            # that uncovered areas (beyond radius of every facility) remain
+            # unassigned and are not counted as covered.
+            _assignment_radius = (
+                float(payload.service_radius)
+                if payload.model_type == ModelType.MAX_COVERAGE
+                else None
+            )
             _t = time.perf_counter()
             final_facility_indices, assignments = await asyncio.to_thread(
                 _capacity_assignment,
@@ -427,6 +646,7 @@ async def _run_optimization_bg(
                 facility_capacities,
                 payload.min_capacity,
                 pre_selected_set,
+                _assignment_radius,
             )
             _timing["8_capacity_assignment"] = time.perf_counter() - _t
 
@@ -439,54 +659,46 @@ async def _run_optimization_bg(
                         facility_to_served[fac_idx].append((area_idx, amount))
 
             # 10. Persist results.
-            orm_results: list[tuple[int, object, list[tuple[int, float]]]] = []
+            # served_with_tt: [(area_i, demand_amount, travel_time_minutes), ...]
+            orm_results: list[tuple[int, object, list[tuple[int, float, float]], float | None]] = []
             for idx in final_facility_indices:
                 area = areas[idx]
                 served = facility_to_served.get(idx, [])
                 covered_dem = float(sum(amt for _, amt in served))
 
-                max_tt = None
-                if served:
-                    served_idx_set = {i for i, _ in served}
-                    rows_c, vals_c = distance_matrix.col_neighbors(idx)
-                    dists = [
-                        int(v)
-                        for r, v in zip(rows_c.tolist(), vals_c.tolist())
-                        if r in served_idx_set
-                    ]
-                    max_tt = float(max(dists)) if dists else None
+                served_with_tt = [
+                    (area_i, amt, distance_matrix.distance_time(area_i, idx))
+                    for area_i, amt in served
+                ]
+                valid_tt = [tt for _, _, tt in served_with_tt if tt < MAX_DIST]
+                max_tt = float(max(valid_tt)) if valid_tt else None
 
-                served_ids = [[areas[i].id, round(amt, 4)] for i, amt in served]
+                served_ids = [[areas[area_i].id, round(amt, 4)] for area_i, amt, _ in served_with_tt]
 
                 orm_result = OptimizationResult(
                     scenario_id=scenario_id,
                     census_area_id=area.id,
                     covered_demand=covered_dem,
-                    assigned_areas=len(served),
+                    assigned_areas=len(served_with_tt),
                     max_travel_time=max_tt,
                     served_area_ids=served_ids,
                 )
                 db.add(orm_result)
-                orm_results.append((idx, area, served))
+                orm_results.append((idx, area, served_with_tt, max_tt))
 
-            # 10.5. Recompute travel-time stats from actual assignments.
+            # 10.5. Compute travel-time stats from cached distances in orm_results.
             _total_assigned = 0.0
             _weighted_tt = 0.0
             _tt_demand = 0.0
             _actual_max_tt = 0.0
-            for _idx, _area_obj, _served in orm_results:
-                _rows, _vals = distance_matrix.col_neighbors(_idx)
-                _dl: dict[int, float] = dict(
-                    zip(_rows.tolist(), [float(v) for v in _vals.tolist()])
-                )
-                for _area_i, _amt in _served:
+            for _idx, _area_obj, _served_with_tt, _max_tt in orm_results:
+                for _area_i, _amt, _tt in _served_with_tt:
                     _total_assigned += _amt
-                    _tt = _dl.get(_area_i)
-                    if _tt is not None and _tt < MAX_DIST:
+                    if _tt < MAX_DIST:
                         _weighted_tt += _amt * _tt
                         _tt_demand += _amt
-                        if _tt > _actual_max_tt:
-                            _actual_max_tt = _tt
+                if _max_tt is not None and _max_tt > _actual_max_tt:
+                    _actual_max_tt = _max_tt
 
             _total_dem = float(np.sum(demand))
             stats["avg_travel_time_minutes"] = (
@@ -499,15 +711,9 @@ async def _run_optimization_bg(
 
             # 11. Build full location objects (with served_areas for map).
             locations = []
-            for idx, area, served in orm_results:
-                rows_c, vals_c = distance_matrix.col_neighbors(idx)
-                dist_lookup: dict[int, float] = {
-                    int(r): float(v)
-                    for r, v in zip(rows_c.tolist(), vals_c.tolist())
-                }
-
+            for idx, area, served_with_tt, max_tt in orm_results:
                 served_area_infos = []
-                for area_i, amt in served:
+                for area_i, amt, tt in served_with_tt:
                     sa = areas[area_i]
                     if sa.x is not None and sa.y is not None:
                         served_area_infos.append(
@@ -517,7 +723,7 @@ async def _run_optimization_bg(
                                 x=sa.x,
                                 y=sa.y,
                                 assigned_demand=round(amt, 4),
-                                travel_time=dist_lookup.get(area_i),
+                                travel_time=round(tt, 1) if tt < MAX_DIST else None,
                             )
                         )
 
@@ -528,9 +734,9 @@ async def _run_optimization_bg(
                         name=area.name,
                         x=area.x,
                         y=area.y,
-                        covered_demand=float(sum(amt for _, amt in served)),
-                        assigned_areas=len(served),
-                        max_travel_time=dist_lookup.get(idx),
+                        covered_demand=float(sum(amt for _, amt, _ in served_with_tt)),
+                        assigned_areas=len(served_with_tt),
+                        max_travel_time=max_tt,
                         is_existing=idx in pre_selected_set,
                         served_areas=served_area_infos,
                     )
@@ -540,13 +746,35 @@ async def _run_optimization_bg(
             stats["_meta"] = {
                 "facility_type": payload.facility_type or "high_school",
                 "mode": payload.mode.value,
+                "target_population_id": payload.target_population_id,
             }
+
+            # 11.5 Compute unassigned areas (scope areas with demand > 0 not served by
+            # any facility).  These are displayed as pink markers on the map.
+            served_census_ids: set[int] = set()
+            for loc in locations:
+                served_census_ids.add(loc.census_area_id)
+                for sa in loc.served_areas:
+                    served_census_ids.add(sa.census_area_id)
+
+            unassigned_areas_out = [
+                {
+                    "census_area_id": a.id,
+                    "area_code": a.area_code,
+                    "name": a.name,
+                    "x": a.x,
+                    "y": a.y,
+                }
+                for idx, a in enumerate(areas)
+                if a.id not in served_census_ids and float(demand[idx]) > 1e-9
+            ]
 
             # 12. Mark scenario completed; store full locations in result_stats.
             scenario.status = ScenarioStatus.COMPLETED
             scenario.result_stats = {
                 **stats,
                 "_locations": [loc.model_dump() for loc in locations],
+                "_unassigned_areas": unassigned_areas_out,
             }
             scenario.completed_at = datetime.now(timezone.utc)
             await db.commit()
@@ -579,6 +807,9 @@ async def _run_optimization_bg(
 # Capacity-constrained assignment                                               #
 # --------------------------------------------------------------------------- #
 
+_FALLBACK_SPEED_KMH = 30.0  # km/h — used when avg_speed_kmh is NULL
+
+
 def _capacity_assignment(
     dm: SparseDistanceMatrix,
     demand: np.ndarray,
@@ -586,6 +817,7 @@ def _capacity_assignment(
     facility_capacities: dict[int, float],
     min_capacity: float | None,
     pre_selected_set: set[int],
+    radius: float | None = None,
 ) -> tuple[list[int], dict[int, list[tuple[int, float]]]]:
     """
     Assign census areas to facilities with capacity constraints.
@@ -594,6 +826,10 @@ def _capacity_assignment(
     in filling a facility's capacity.  When an area's demand exceeds the
     remaining capacity of its nearest facility, the overflow goes to the next
     nearest facility with available capacity (partial assignment).
+
+    If radius is provided, only facilities within that travel-time radius are
+    considered for each area.  Areas with no facility within radius are left
+    unassigned (uncovered).
 
     After assignment, any *planned* (non-pre-selected) facility whose total
     assigned demand is below min_capacity is discarded, and the entire
@@ -610,7 +846,7 @@ def _capacity_assignment(
     for _ in range(len(solver_facility_indices) + 1):
         if not active:
             break
-        assignments, fac_demand = _single_capacity_pass(dm, demand, active, facility_capacities)
+        assignments, fac_demand = _single_capacity_pass(dm, demand, active, facility_capacities, radius)
 
         if not min_capacity:
             break
@@ -633,10 +869,14 @@ def _single_capacity_pass(
     demand: np.ndarray,
     facility_indices: list[int],
     facility_capacities: dict[int, float],
+    radius: float | None = None,
 ) -> tuple[dict[int, list[tuple[int, float]]], dict[int, float]]:
     """
     One greedy pass: assign each area to its nearest facility(ies) subject to
     capacity, processing areas in ascending order of distance to nearest facility.
+
+    If radius is provided, only facilities within that travel-time radius of the
+    area are eligible.  Areas with no facility within radius are left unassigned.
     """
     fac_set = set(facility_indices)
     remaining: dict[int, float] = {f: facility_capacities.get(f, math.inf) for f in facility_indices}
@@ -654,9 +894,11 @@ def _single_capacity_pass(
 
         area_asgn: list[tuple[int, float]] = []
         rem = d
-        for fac in _sorted_facilities_for_area(dm, i, fac_set):
+        for dist, fac in _sorted_facilities_for_area(dm, i, fac_set):
             if rem <= 1e-9:
                 break
+            if radius is not None and dist > radius:
+                break  # sorted by distance; all subsequent are farther
             cap = remaining.get(fac, 0.0)
             if cap <= 1e-9:
                 continue
@@ -676,29 +918,16 @@ def _sorted_facilities_for_area(
     dm: SparseDistanceMatrix,
     area_idx: int,
     fac_set: set[int],
-) -> list[int]:
+) -> list[tuple[float, int]]:
     """
-    Return facility indices sorted by distance to area_idx (ascending).
-    Facilities not stored as CSR neighbors appear last at MAX_DIST.
-    """
-    s = int(dm.csr_ptr[area_idx])
-    e = int(dm.csr_ptr[area_idx + 1])
-    neighbors = dm.csr_col[s:e]
-    distances = dm.csr_val[s:e]
+    Return (distance, facility_index) pairs sorted by travel time to area_idx (ascending).
 
-    pairs: list[tuple[int, int]] = [
-        (int(distances[k]), int(neighbors[k]))
-        for k in range(len(neighbors))
-        if int(neighbors[k]) in fac_set
-    ]
+    Uses dm.distance_time() which returns the stored value when available
+    and falls back to the harmonic-mean speed estimate for missing pairs.
+    """
+    pairs = [(dm.distance_time(area_idx, fac), fac) for fac in fac_set]
     pairs.sort()
-
-    seen = {fac for _, fac in pairs}
-    for fac in fac_set:
-        if fac not in seen:
-            pairs.append((MAX_DIST, fac))
-
-    return [fac for _, fac in pairs]
+    return pairs
 
 
 # --------------------------------------------------------------------------- #
