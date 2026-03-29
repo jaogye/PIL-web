@@ -14,13 +14,15 @@ This repository is the **web migration** of the original LIP2 Java desktop proto
 |---|---|
 | **P-Median** | Minimise total demand-weighted travel time — maximises efficiency |
 | **P-Center** | Minimise the maximum travel time — maximises equity |
-| **Maximum Coverage** | Maximise population served within a time radius |
+| **Maximum Coverage** | Maximise population served within a time radius (GRASP + capacitated assignment) |
+| **Bump Hunter** | Identify high-demand clusters as exploratory facility placement candidates |
 | **Capacity Rebalancing** | Redistribute capacity across existing facilities to reduce unmet demand |
 | **Reoptimization** | Fix user-selected facility locations and re-optimize the remainder |
 | **Excel / JSON Reports** | One-click export of results for planning documents |
 | **Interactive Map** | Visualise facility locations on a MapLibre GL map with layer control |
 | **Multi-Country** | Switch between country databases (Ecuador, Belgium) via a dropdown |
 | **Geographic Scope** | Filter optimization by political divisions (region > province > municipality) |
+| **Target Population** | Per-facility-type population groups (school-age, patients, etc.) for demand weighting |
 
 ---
 
@@ -73,15 +75,17 @@ PIL-web/
 │   │   │   ├── infrastructure.py    # CRUD /infrastructure/
 │   │   │   ├── impacts.py           # POST /impacts/calculate
 │   │   │   ├── reports.py           # GET  /reports/scenario/{id}/excel|json
-│   │   │   └── political_divisions.py  # GET /political-divisions/tree
+│   │   │   ├── political_divisions.py  # GET /political-divisions/tree
+│   │   │   └── target_population.py # GET /target-population/
 │   │   ├── models/                  # SQLAlchemy ORM models
 │   │   ├── schemas/                 # Pydantic request/response schemas
 │   │   └── optimization/            # Core algorithms
 │   │       ├── sparse_matrix.py     # CSR + CSC sparse distance matrix
 │   │       ├── p_median.py          # Greedy add + 1-opt exchange
 │   │       ├── p_center.py          # L-Layered search + greedy set cover
-│   │       ├── max_coverage.py      # Greedy MCLP + capacitated assignment
-│   │       └── rebalancing.py       # Capacity rebalancing heuristic
+│   │       ├── max_coverage.py      # GRASP + CMCLP-CAC capacitated assignment
+│   │       ├── rebalancing.py       # Capacity rebalancing heuristic
+│   │       └── bump_hunter.py       # Gravity-weighted local-maxima detection
 │   ├── scripts/
 │   │   └── belgium/                 # Belgium ETL pipeline (see below)
 │   ├── Dockerfile
@@ -103,9 +107,12 @@ PIL-web/
 │
 ├── database/
 │   └── migrations/
-│       ├── 001_initial_schema.sql   # Core schema (census_areas, facilities, etc.)
-│       ├── 002_served_areas.sql     # Served-area result storage
-│       └── 003_facility_type_lookup.sql  # Facility type reference table
+│       ├── 001_initial_schema.sql        # Core schema (census_areas, facilities, etc.)
+│       ├── 002_served_areas.sql          # Served-area result storage
+│       ├── 003_facility_type_lookup.sql  # Facility type reference table
+│       ├── 004_target_population.sql     # Census groups + per-area population
+│       ├── 005_avg_speed_kmh.sql         # Median routing speed per census area
+│       └── 006_bump_hunter_model_type.sql # Adds bump_hunter to model_type enum
 │
 └── docker-compose.yml               # Full local stack (db + api + frontend)
 ```
@@ -173,8 +180,14 @@ All algorithms operate on a **sparse travel-time matrix** between census areas a
 ### Maximum Coverage (MCLP)
 
 **Objective:** maximise `Σ demand[i]` for all areas within service radius R.
-**Algorithm:** Capacitated Greedy-Add with overflow redistribution and min-capacity pruning.
+**Algorithm:** GRASP (Greedy Randomized Adaptive Search Procedure) with proportional-exponential construction and first-improvement local search; capacitated assignment via Closest Assignment Constraints (CMCLP-CAC).
 **Use case:** Budget-constrained planning — maximise the number of people served within a time budget.
+
+### Bump Hunter
+
+**Objective:** identify census areas that are local maxima of a gravity-weighted demand score.
+**Algorithm:** Gravity score `s[i] = demand[i] + Σ demand[j] / (1 + dist(j → i))` over k-nearest neighbours; local maximum detection via KDTree spatial KNN (fallback to CSR neighbours for n > 2,000).
+**Use case:** Exploratory analysis — suggest high-demand clusters without fixing the number of facilities p.
 
 ### Capacity Rebalancing
 
@@ -239,6 +252,7 @@ The full interactive API documentation is available at `/docs` (Swagger UI) and 
 | `GET` | `/api/v1/reports/scenario/{id}/json` | Download JSON export |
 | `GET` | `/api/v1/political-divisions/tree` | Full political division hierarchy |
 | `POST` | `/api/v1/political-divisions/census-summary` | Census summary for selected parishes |
+| `GET` | `/api/v1/target-population/` | List census population groups (school-age, patients, etc.) |
 | `GET` | `/health` | Health check |
 
 All endpoints that access country data require the `X-LIP2-Database` header specifying the target database (e.g. `lip2_ecuador`).
