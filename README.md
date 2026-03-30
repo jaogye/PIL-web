@@ -14,7 +14,7 @@ This repository is the **web migration** of the original LIP2 Java desktop proto
 |---|---|
 | **P-Median** | Minimise total demand-weighted travel time — maximises efficiency |
 | **P-Center** | Minimise the maximum travel time — maximises equity |
-| **Maximum Coverage** | Maximise population served within a time radius (GRASP + capacitated assignment) |
+| **Maximum Coverage** | Maximise population served within a time radius (momentum-based alternating greedy + capacitated assignment + redundancy pruning) |
 | **Bump Hunter** | Identify high-demand clusters as exploratory facility placement candidates |
 | **Capacity Rebalancing** | Redistribute capacity across existing facilities to reduce unmet demand |
 | **Reoptimization** | Fix user-selected facility locations and re-optimize the remainder |
@@ -180,7 +180,7 @@ All algorithms operate on a **sparse travel-time matrix** between census areas a
 ### Maximum Coverage (MCLP)
 
 **Objective:** maximise `Σ demand[i]` for all areas within service radius R.
-**Algorithm:** GRASP (Greedy Randomized Adaptive Search Procedure) with proportional-exponential construction and first-improvement local search; capacitated assignment via Closest Assignment Constraints (CMCLP-CAC).
+**Algorithm:** Momentum-based alternating greedy (CMCLP-CAC). A momentum score `momentum[i] = Σ_j remaining[j] · speed(i,j)` drives facility placement in alternating MAX turns (densest uncovered cluster) and MIN turns (most peripheral area). Each placed facility fills demand nearest-first up to `cap_min`. Redundancy pruning (Phase 2B) iteratively removes facilities whose served areas can be absorbed by neighbours without exceeding `cap_max`.
 **Use case:** Budget-constrained planning — maximise the number of people served within a time budget.
 
 ### Bump Hunter

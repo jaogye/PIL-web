@@ -3,6 +3,7 @@ LIP2 – Localizador de Infraestructura Pública v2
 FastAPI application entry point.
 """
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -12,6 +13,19 @@ from fastapi.responses import JSONResponse
 from app.config import get_settings
 from app.api.routes import optimization, infrastructure, impacts, reports, political_divisions, target_population
 from fastapi.responses import JSONResponse
+
+# Attach a stdout handler so INFO messages from the optimization module are
+# visible in Docker logs regardless of uvicorn's root logger configuration.
+_debug_handler = logging.StreamHandler()
+_debug_handler.setLevel(logging.DEBUG)
+_debug_handler.setFormatter(
+    logging.Formatter("%(levelname)s: [%(name)s] %(message)s")
+)
+for _logger_name in ("app.optimization", "app.api.routes.optimization"):
+    _lg = logging.getLogger(_logger_name)
+    _lg.setLevel(logging.INFO)
+    _lg.addHandler(_debug_handler)
+    _lg.propagate = False
 
 settings = get_settings()
 

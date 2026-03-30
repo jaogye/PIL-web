@@ -55,9 +55,19 @@ class OptimizationRequest(BaseModel):
     min_capacity: float | None = Field(None, ge=0.0)
     max_capacity: float | None = Field(None, ge=0.0)
 
-    # Reoptimization: exact list of census_area_ids to treat as fixed (pre-selected) facilities.
-    # When provided, overrides the complete_existing mode lookup.
+    # Reoptimization: exact list of census_area_ids to treat as fixed facilities.
+    # When provided, the solver is skipped; a constrained nearest-assignment is
+    # run directly over these facilities.  Overrides the complete_existing mode.
     fixed_census_area_ids: list[int] | None = None
+
+    # Subset of fixed_census_area_ids containing only facilities newly placed by
+    # the user during the reoptimization step (right-click "Add Facility Here").
+    # Facilities in fixed_census_area_ids but NOT in this list are treated as
+    # "kept" (from the previous optimization run) and must retain at least
+    # min_capacity demand after assignment.
+    # For max_coverage, user-created facilities only accept areas within the
+    # service radius.
+    reopt_new_facility_ids: list[int] | None = None
 
     # Target population to use as demand (references target_population.id).
     # If None, the default for the selected facility_type is used.

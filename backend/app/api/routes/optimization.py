@@ -576,16 +576,35 @@ async def _run_optimization_bg(
             pre_selected: list[int] = []
             pre_selected_set: set[int] = set()
             existing_capacity: dict[int, float] = {}
+            is_reoptimization = payload.fixed_census_area_ids is not None
 
-            if payload.fixed_census_area_ids is not None:
-                # Reoptimization: user specified exact fixed facilities by census_area_id.
+            # Variables used only in the reoptimization path.
+            kept_indices: list[int] = []
+            new_indices:  list[int] = []
+
+            if is_reoptimization:
+                # Reoptimization: skip the solver and run a constrained nearest-assignment
+                # over the exact set of facilities the user has confirmed.
+                #
+                # Kept facilities  = fixed_census_area_ids - reopt_new_facility_ids
+                #   → must retain at least min_capacity demand (cap_min floor)
+                # User-created     = reopt_new_facility_ids
+                #   → empty at start; filled up to cap_max; for max_coverage,
+                #     only areas within service_radius are eligible
                 area_id_to_idx = {a.id: i for i, a in enumerate(areas)}
+                new_id_set = set(payload.reopt_new_facility_ids or [])
+
                 for cid in payload.fixed_census_area_ids:
-                    if cid in area_id_to_idx:
-                        idx = area_id_to_idx[cid]
-                        pre_selected.append(idx)
+                    if cid not in area_id_to_idx:
+                        continue
+                    idx = area_id_to_idx[cid]
+                    if cid in new_id_set:
+                        new_indices.append(idx)
+                    else:
+                        kept_indices.append(idx)
+
+                pre_selected = kept_indices + new_indices
                 pre_selected_set = set(pre_selected)
-                # existing_capacity left empty → fixed facilities use max_capacity (or inf).
 
             elif payload.mode == OptimizationMode.COMPLETE_EXISTING and payload.facility_type:
                 try:
@@ -612,43 +631,80 @@ async def _run_optimization_bg(
             # 5. Load scenario from DB.
             scenario = await db.get(OptimizationScenario, scenario_id)
 
-            # 6. Run solver (CPU-bound – off-loads to thread pool).
+            # 6. Run solver OR reoptimization constrained-assignment.
             _t = time.perf_counter()
-            facility_indices, stats = await asyncio.to_thread(
-                _run_solver, payload, demand, distance_matrix, pre_selected
-            )
-            _timing["6_solver"] = time.perf_counter() - _t
 
-            # 7. Build per-facility capacity map.
-            max_cap = float(payload.max_capacity) if payload.max_capacity else math.inf
-            facility_capacities: dict[int, float] = {
-                fac: existing_capacity.get(fac, math.inf)
-                if fac in pre_selected_set
-                else max_cap
-                for fac in facility_indices
-            }
+            if is_reoptimization:
+                # Skip the solver entirely.  Assign census areas directly to the
+                # user-confirmed set of facilities using nearest-first order.
+                cap_min_f = float(payload.min_capacity or 0.0)
+                cap_max_f = float(payload.max_capacity) if payload.max_capacity else math.inf
+                final_facility_indices, assignments = await asyncio.to_thread(
+                    _reopt_assignment,
+                    distance_matrix, demand,
+                    kept_indices, new_indices,
+                    cap_min_f, cap_max_f,
+                    payload.model_type == ModelType.MAX_COVERAGE,
+                    float(payload.service_radius) if payload.service_radius else None,
+                )
+                _timing["6_reopt_assignment"] = time.perf_counter() - _t
 
-            # 8. Capacity-constrained assignment (CPU-bound).
-            # For max_coverage, only assign areas within the service radius so
-            # that uncovered areas (beyond radius of every facility) remain
-            # unassigned and are not counted as covered.
-            _assignment_radius = (
-                float(payload.service_radius)
-                if payload.model_type == ModelType.MAX_COVERAGE
-                else None
-            )
-            _t = time.perf_counter()
-            final_facility_indices, assignments = await asyncio.to_thread(
-                _capacity_assignment,
-                distance_matrix,
-                demand,
-                facility_indices,
-                facility_capacities,
-                payload.min_capacity,
-                pre_selected_set,
-                _assignment_radius,
-            )
-            _timing["8_capacity_assignment"] = time.perf_counter() - _t
+                # Build minimal stats (travel-time fields are filled in step 10.5).
+                total_dem = float(np.sum(demand))
+                assigned_dem = sum(
+                    sum(amt for _, amt in asgns)
+                    for asgns in assignments.values()
+                )
+                stats: dict = {
+                    "total_demand": round(total_dem, 2),
+                    "covered_demand": round(assigned_dem, 2),
+                    "uncovered_demand": round(total_dem - assigned_dem, 2),
+                    "coverage_pct": (
+                        round(assigned_dem / total_dem * 100, 2) if total_dem > 0 else 0.0
+                    ),
+                    "num_facilities": len(final_facility_indices),
+                    "service_radius_minutes": payload.service_radius,
+                    "cap_min": payload.min_capacity,
+                    "cap_max": payload.max_capacity,
+                }
+
+            else:
+                # Standard path: run the solver then capacity-constrain the assignment.
+                facility_indices, stats = await asyncio.to_thread(
+                    _run_solver, payload, demand, distance_matrix, pre_selected
+                )
+                _timing["6_solver"] = time.perf_counter() - _t
+
+                # 7. Build per-facility capacity map.
+                max_cap = float(payload.max_capacity) if payload.max_capacity else math.inf
+                facility_capacities: dict[int, float] = {
+                    fac: existing_capacity.get(fac, math.inf)
+                    if fac in pre_selected_set
+                    else max_cap
+                    for fac in facility_indices
+                }
+
+                # 8. Capacity-constrained assignment (CPU-bound).
+                # For max_coverage, only assign areas within the service radius so
+                # that uncovered areas (beyond radius of every facility) remain
+                # unassigned and are not counted as covered.
+                _assignment_radius = (
+                    float(payload.service_radius)
+                    if payload.model_type == ModelType.MAX_COVERAGE
+                    else None
+                )
+                _t = time.perf_counter()
+                final_facility_indices, assignments = await asyncio.to_thread(
+                    _capacity_assignment,
+                    distance_matrix,
+                    demand,
+                    facility_indices,
+                    facility_capacities,
+                    payload.min_capacity,
+                    pre_selected_set,
+                    _assignment_radius,
+                )
+                _timing["8_capacity_assignment"] = time.perf_counter() - _t
 
             # 9. Invert assignments.
             final_set = set(final_facility_indices)
@@ -808,6 +864,112 @@ async def _run_optimization_bg(
 # --------------------------------------------------------------------------- #
 
 _FALLBACK_SPEED_KMH = 30.0  # km/h — used when avg_speed_kmh is NULL
+
+
+def _reopt_assignment(
+    dm: SparseDistanceMatrix,
+    demand: np.ndarray,
+    kept_indices: list[int],
+    new_indices: list[int],
+    cap_min: float,
+    cap_max: float,
+    enforce_radius: bool,
+    radius: float | None,
+) -> tuple[list[int], dict[int, list[tuple[int, float]]]]:
+    """
+    Constrained nearest-assignment for reoptimization.
+
+    The solver is bypassed entirely.  Census areas are assigned to the set of
+    facilities the user has confirmed (kept from the previous run + newly added).
+
+    Kept facilities (from the previous optimization run):
+      - No service-radius restriction (their placement was already radius-aware).
+      - After the main pass, each kept facility whose load is below cap_min has
+        demand pulled from the nearest user-created facilities until the floor
+        is satisfied.  This prevents kept facilities from becoming empty when
+        a nearby user-created facility attracts all their demand.
+
+    User-created (newly added) facilities:
+      - For max_coverage (enforce_radius=True): only census areas within
+        `radius` minutes are eligible; areas outside cannot be routed there.
+      - For all other models: no radius restriction.
+      - Hard ceiling: cap_max.
+
+    Both facility types share the same cap_max ceiling.
+    Demand is split across multiple facilities only when a facility is full.
+    """
+    all_indices = kept_indices + new_indices
+    kept_set    = set(kept_indices)
+    new_set     = set(new_indices)
+    fac_set     = set(all_indices)
+
+    remaining: dict[int, float] = {f: cap_max for f in all_indices}
+    fac_load: dict[int, float]  = defaultdict(float)
+    assignments: dict[int, list[tuple[int, float]]] = {}
+
+    # Main pass: nearest-first, radius only for user-created in max_coverage.
+    min_dists  = dm.min_dist_to_set(all_indices)
+    area_order = np.argsort(min_dists, kind="stable").tolist()
+
+    for i in area_order:
+        d = float(demand[i])
+        if d <= 1e-9:
+            continue
+        rem = d
+        area_asgn: list[tuple[int, float]] = []
+        for dist, fac in _sorted_facilities_for_area(dm, i, fac_set):
+            if rem <= 1e-9:
+                break
+            # For max_coverage: user-created facilities only within service radius.
+            if enforce_radius and fac in new_set and radius is not None and dist > radius:
+                continue
+            cap_left = remaining.get(fac, 0.0)
+            if cap_left <= 1e-9:
+                continue
+            take = min(rem, cap_left)
+            area_asgn.append((fac, take))
+            remaining[fac] -= take
+            fac_load[fac]  += take
+            rem -= take
+        if area_asgn:
+            assignments[i] = area_asgn
+
+    # Floor enforcement: kept facilities must retain >= cap_min demand.
+    # Pull demand from the nearest user-created facilities that serve areas
+    # within the kept facility's neighbourhood, until the floor is satisfied.
+    if cap_min > 0 and new_indices:
+        for kf in kept_indices:
+            deficit = cap_min - fac_load.get(kf, 0.0)
+            if deficit <= 1e-9:
+                continue
+            rows, vals = dm.col_neighbors(kf)
+            order = np.argsort(vals, kind="stable")
+            for k in order:
+                if deficit <= 1e-9:
+                    break
+                area_i = int(rows[k])
+                if area_i not in assignments:
+                    continue
+                for donor, amt in [(f, a) for f, a in assignments[area_i] if f in new_set]:
+                    steal = min(amt, deficit)
+                    rebuilt: list[tuple[int, float]] = []
+                    for f2, a2 in assignments[area_i]:
+                        if f2 == donor:
+                            leftover = a2 - steal
+                            if leftover > 1e-9:
+                                rebuilt.append((f2, leftover))
+                        else:
+                            rebuilt.append((f2, a2))
+                    rebuilt.append((kf, steal))
+                    assignments[area_i] = rebuilt
+                    fac_load[donor]           -= steal
+                    fac_load[kf]              = fac_load.get(kf, 0.0) + steal
+                    remaining[donor]          += steal
+                    deficit                   -= steal
+                    if deficit <= 1e-9:
+                        break
+
+    return all_indices, assignments
 
 
 def _capacity_assignment(

@@ -231,7 +231,7 @@ If the oracle returns fewer than `p` facilities (feasible with fewer), furthest 
 
 **Variables:**
 - `x_j ∈ {0, 1}` — 1 if facility j is opened
-- `y_ij ∈ {0, 1}` — 1 if area i is covered by facility j
+- `y_ij ∈ {0, 1}` — 1 if area i is served by facility j
 
 **Objective (maximise):**
 ```
@@ -240,7 +240,6 @@ If the oracle returns fewer than `p` facilities (feasible with fewer), furthest 
 
 **Constraints:**
 ```
-Σ_j x_j = p                                  (exactly p open facilities)
 y_ij ≤ x_j               ∀ i, j              (assign only to open facilities)
 d(i, j) ≤ R              ∀ (i,j): y_ij = 1  (service radius constraint)
 Σ_i demand[i] y_ij ≤ cap_max  ∀ j           (facility capacity ceiling)
@@ -248,80 +247,100 @@ d(i, j) ≤ R              ∀ (i,j): y_ij = 1  (service radius constraint)
 y_ij = 1 only for j = nearest open facility  (closest assignment)
 ```
 
-### Algorithm: GRASP with Proportional-Exponential Construction
+Note: the number of open facilities is not fixed to `p` a priori. The algorithm places as many facilities as are needed to exhaust demand, subject to the capacity constraints. The `p` parameter is accepted for API compatibility but does not constrain placement.
 
-GRASP (Greedy Randomized Adaptive Search Procedure) runs `N_GRASP_ITER = 5` independent trials; the best result is kept.
+### Algorithm: Momentum-Based Alternating Greedy + Redundancy Pruning
 
-#### Phase 0 – Pre-existing Facilities
+#### Phase 0 – Pre-existing Facilities  `O(k × n_pre)`
 
-Fixed facilities (from mode `complete_existing` or explicit `fixed_census_area_ids`) are selected first. Their covered demand is excluded from the construction budget.
+Fixed facilities (from `pre_selected`) are registered first and their demand is absorbed using nearest-first assignment up to `cap_max`, reducing `remaining[i]` before Phase 1 begins.
 
-#### Phase 1 – Zone Precomputation
+#### Phase 1 – Momentum Computation  `O(nnz)`
 
-For each candidate facility `j`, compute all areas within radius `R` once:
-
-```
-zone[j] ← sorted list of (area, distance) with distance ≤ R
-          (stored neighbours + estimated pairs)
-```
-
-This caches `col_neighbors_full(j, R)` to avoid repeated O(n) calls in the local search hot loop.
-
-#### Phase 2 – GRASP Construction (per trial)
-
-**Proportional-Exponential Greedy (`pgreedy_exp`):**
+For each candidate area `i`, a **momentum indicator** measures its accessibility to uncovered demand weighted by routing speed:
 
 ```
-while |S| < p:
-    score[j] ← uncovered_demand_within_R(j)   # O(nnz) via marginal_coverage()
-    rank[j]  ← argsort(-score)
-    prob[j]  ∝ exp(−α × rank[j])   with α = 0.05
-    j_new    ← random choice weighted by prob
-    S ← S ∪ {j_new}
-    update uncovered set
+momentum[i] = Σ_j  remaining[j] · speed(i, j)
 ```
 
-The exponential bias (`α = 0.05`) strongly favours top-ranked candidates but allows controlled exploration, avoiding the pure greedy local optima.
-
-#### Phase 3 – First-Improvement Local Search (per trial)
+where `speed(i, j)` is the estimated road speed in km/h between areas `i` and `j`:
 
 ```
-repeat:
-    for each open non-fixed facility f_l ∈ S:
-        # Build neighbourhood: sample 20 areas from zone[f_l]
-        # Collect all CSR neighbours of those areas as candidates
-        # Score candidates by uncovered marginal gain
-        # Evaluate top 25 via CAC re-assignment (see Phase 4)
-        if best_candidate improves coverage:
-            S ← (S \ {f_l}) ∪ {best_candidate}
-            break  # first-improvement: restart
-until no improvement or max_rounds = 20 reached
+speed(i, j) = D_km(i, j) / (travel_time_min(i, j) / 60)
 ```
 
-#### Phase 4 – Closest Assignment Constraint (CAC) Re-assignment
+Momentum is high for areas surrounded by dense uncovered population served by fast roads (dense urban cores). Momentum is low for isolated peripheral areas.
 
-After any change to `S`:
+**Precomputation:** CSR speeds `speed(i → j)` and CSC speeds `speed(i ← j)` are computed once from the stored pairs. Momentum uses the CSR structure (O(nnz) bincount). After each facility placement, momentum is updated incrementally in O(k) using the CSC structure — no full recomputation.
+
+If xy coordinates are unavailable or momentum is degenerate (all-zero or NaN), the algorithm falls back to a plain demand-coverage greedy.
+
+#### Phase 1 – Alternating MAX/MIN Placement Loop
+
+Facilities are opened in alternating turns:
+
+| Turn | Selection | Purpose |
+|------|-----------|---------|
+| **MAX** | `argmax momentum` among valid candidates | Covers the densest uncovered cluster (efficiency) |
+| **MIN** | `argmin momentum` among valid candidates | Covers the most isolated peripheral area (equity) |
+
+The turn cycle is `equity_ratio` MAX turns followed by 1 MIN turn (default `equity_ratio = 1` → strict 1-MAX / 1-MIN alternation).
+
+**Fill rule** — nearest-first up to `cap_min`:
 
 ```
-for each area i (sorted by distance to nearest open facility):
-    j_nearest ← nearest open facility within R
-    if j_nearest exists and load[j_nearest] + demand[i] ≤ cap_max:
-        assign i → j_nearest
-        load[j_nearest] += demand[i]
-    else:
-        i is uncovered
+For facility j selected on any turn:
+    zone ← areas within radius R, sorted by travel time ascending
+    load ← 0,  taken ← []
+    for each area i in zone (in order):
+        if remaining[i] ≤ 0: skip
+        if load + demand[i] > cap_max: skip
+        load += demand[i]
+        taken.append(i)
+        if load ≥ cap_min: break   ← stop once minimum is met
+    if load < cap_min: turn FAILS (candidate rejected)
 ```
 
-This enforces both the radius constraint and capacity ceiling simultaneously.
+A candidate is rejected if its zone does not contain enough unassigned demand to reach `cap_min`. Two consecutive failed turns terminate Phase 1.
 
-#### Phase 5 – Drop Facilities Below Minimum
+**Valid candidate filter:** a candidate is only eligible if its marginal coverage score (total remaining demand within radius, capped at `cap_max`) is at least `cap_min`.
+
+#### Phase 2B – Redundancy Pruning  `O(F² × k)` amortised
+
+After Phase 1, the solution may contain spatially clustered facilities where some are dominated by their neighbours. Phase 2B iteratively removes redundant facilities:
 
 ```
-for each facility f ∈ S with load[f] < cap_min:
-    S ← S \ {f}
+while any facility was removed in last pass:
+    candidates ← new facilities sorted by load ascending (lightest first)
+    for each candidate fac:
+        served ← areas assigned to fac
+        if served is empty:
+            remove fac immediately
+        else:
+            for each area a in served:
+                find best alternative facility g ≠ fac within radius R
+                    with fac_remaining[g] ≥ demand[a]
+            if all areas can be feasibly reassigned:
+                commit reassignment; remove fac
+                break  ← restart inner loop
 ```
 
-Facilities that attract less demand than the operational floor are removed.
+A facility is removed only when **all** its served areas can be absorbed by other open facilities without exceeding `cap_max`. The lightest-first order ensures a progressive, homogeneous spatial distribution.
+
+**Implementation note:** when removing a facility at position `old_pos` in `selected`, the `assigned_to` index array is updated in two steps that must capture both masks *before* any modification to avoid a cascading-removal bug:
+
+```python
+mask_stranded = assigned_to == old_pos   # truly lost areas (not reassigned)
+mask_shift    = assigned_to > old_pos    # need position correction after pop
+assigned_to[mask_shift] -= 1
+assigned_to[mask_stranded] = -1
+```
+
+Inverting this order (decrement first, then zero) incorrectly zeroes reassigned areas when the receiving facility was at `old_pos + 1`, causing it to appear empty and be pruned in cascade.
+
+#### Defensive cap_min Filter
+
+After Phase 2B, any facility whose final load fell below `cap_min` (possible only if Phase 2B redistribution left it with too little demand) is dropped.
 
 ---
 
@@ -414,9 +433,10 @@ Each iteration records a `(from_facility, to_facility, amount, impact)` tuple. T
 | **P-Center** | Furthest Insertion | O(p × nnz) | `min_dist_to_set` per step |
 | **P-Center** | L-Layered Search | O(L × N^(1/L)) oracle calls | Feasibility oracle × L calls |
 | **P-Center** | Greedy Dom. Set | O(n log n) per oracle call | Priority queue over uncovered |
-| **Max Coverage** | Zone precompute | O(p × nnz) once | `col_neighbors_full` per candidate |
-| **Max Coverage** | GRASP construction | O(N_ITER × p × nnz) | `marginal_coverage()` per step |
-| **Max Coverage** | Local search | O(rounds × p × 25 × n) | CAC re-assignment per candidate eval |
+| **Max Coverage** | Momentum precompute | O(nnz) | `np.bincount` over CSR/CSC speeds |
+| **Max Coverage** | Momentum update | O(k) per placement | Incremental CSC subtraction |
+| **Max Coverage** | Placement loop | O(F × nnz) | `marginal_coverage()` + fill per turn |
+| **Max Coverage** | Phase 2B pruning | O(F² × k) amortised | Distance lookup per area per candidate |
 | **Bump Hunter** | Gravity score | O(n × k_vec) | Sparse dot product over kNN |
 | **Bump Hunter** | Local maxima | O(n log n) | KDTree spatial query |
 | **Rebalancing** | Assignment | O(nnz) | `assign()` single pass |
@@ -424,9 +444,10 @@ Each iteration records a `(from_facility, to_facility, amount, impact)` tuple. T
 
 **Notation:**
 - `n` — number of census areas
-- `p` — number of facilities to place
-- `nnz` — number of stored pairs in the sparse matrix (`≈ n × k`, k ≈ 500)
-- `N_ITER` — number of GRASP iterations (default 5)
+- `p` — number of facilities (API parameter; not a hard constraint in MCLP)
+- `F` — number of facilities actually placed by Phase 1 (≈ total_demand / cap_min)
+- `k` — stored neighbours per area (≈ 500)
+- `nnz` — total stored pairs (`≈ n × k`)
 - `L` — number of layers in L-Layered Search (default 3)
 
 ---
@@ -436,4 +457,5 @@ Each iteration records a `(from_facility, to_facility, amount, impact)` tuple. T
 - Kramer, R., Iori, M., & Vidal, T. (2018). *Mathematical models and search algorithms for the capacitated p-center problem.* INFORMS Journal on Computing, 32(2).
 - Church, R., & ReVelle, C. (1974). *The maximal covering location problem.* Papers of the Regional Science Association.
 - ReVelle, C., & Swain, R. (1970). *Central facilities location.* Geographical Analysis, 2(1).
-- Feo, T. A., & Resende, M. G. C. (1995). *Greedy randomized adaptive search procedures.* Journal of Global Optimization, 6(2).
+- Drezner, Z., & Hamacher, H. W. (Eds.) (2002). *Facility Location: Applications and Theory.* Springer. (Momentum-based and equity-aware heuristics for capacitated coverage.)
+- Downs, B. T., & Camm, J. D. (1996). *An exact algorithm for the maximal covering location problem.* Naval Research Logistics, 43(3).

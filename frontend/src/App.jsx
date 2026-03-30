@@ -187,12 +187,13 @@ function AppInner() {
         parameters: undefined,  // skip bump-hunter algorithm; just reassign
       };
     } else {
-      const fixedIds = Array.from(new Set([
-        ...(optimizationResult.facility_locations || [])
-          .filter((f) => f.is_existing && !userEdits.removed.has(f.census_area_id))
-          .map((f) => f.census_area_id),
-        ...userEdits.added,
-      ]));
+      // All facilities the user has kept (not explicitly removed) become fixed.
+      // The solver is skipped; a constrained nearest-assignment runs instead.
+      const keptIds = (optimizationResult.facility_locations || [])
+        .filter((f) => !userEdits.removed.has(f.census_area_id))
+        .map((f) => f.census_area_id);
+      const newFacilityIds = Array.from(userEdits.added);
+      const fixedIds = Array.from(new Set([...keptIds, ...newFacilityIds]));
       const baseP = optimizationResult.p_facilities ?? fixedIds.length;
       const newP = Math.min(200, Math.max(baseP, fixedIds.length));
       payload = {
@@ -201,6 +202,9 @@ function AppInner() {
         p_facilities: newP,
         mode: "from_scratch",
         fixed_census_area_ids: fixedIds,
+        // User-created facilities need different assignment rules (radius for
+        // max_coverage; no cap_min floor since they start empty).
+        reopt_new_facility_ids: newFacilityIds.length > 0 ? newFacilityIds : undefined,
       };
     }
 
