@@ -83,5 +83,9 @@ backend/scripts/**/pois*/
 tmp.*
 speed_histogram.*
 
+# ── Database dumps (can be very large) ─────────────────────────────────────
+*.dump
+lip2_*.sql
+
 # ── Validation / scratch scripts left at project root ──────────────────────
 validate_distances.py
