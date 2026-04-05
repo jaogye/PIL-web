@@ -2,7 +2,7 @@ services:
 
   # ── PostgreSQL + PostGIS ──────────────────────────────────────────────────
   db:
-    image: postgis/postgis:16-3.5
+    image: imresamu/postgis:16-3.4
     restart: unless-stopped
     environment:
       POSTGRES_USER: lip2
