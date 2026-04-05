@@ -434,6 +434,7 @@ export default function MapView({
               demand: sa.assigned_demand,
               travel_time: sa.travel_time,
               area_code: sa.area_code,
+              avg_speed_kmh: sa.avg_speed_kmh,
               facility_area_code: facility.area_code,
               facility_x: facility.x,
               facility_y: facility.y,
@@ -450,7 +451,7 @@ export default function MapView({
       }
 
       // 2. Yellow squares (census areas) — clickable popup + right-click to add as facility.
-      squareMap.forEach(({ censusAreaId, x, y, demand, travel_time, area_code, facility_area_code, facility_x, facility_y }) => {
+      squareMap.forEach(({ censusAreaId, x, y, demand, travel_time, area_code, avg_speed_kmh, facility_area_code, facility_x, facility_y }) => {
         const isAdded = added.has(censusAreaId);
         const el = document.createElement("div");
 
@@ -488,6 +489,10 @@ export default function MapView({
           }
         }
 
+        const vpdStr = avg_speed_kmh != null
+          ? `${Number(avg_speed_kmh).toFixed(1)} km/h`
+          : "—";
+
         const popupHtml = isAdded
           ? `<strong>Proposed Facility</strong><br/>
              Code: <strong>${area_code || "—"}</strong><br/>
@@ -498,6 +503,7 @@ export default function MapView({
              Access time: <strong>${ttStr}</strong><br/>
              Distance: <strong>${distKmStr}</strong><br/>
              Travel speed: <strong>${speedStr}</strong><br/>
+             Avg. area speed (vpd): <strong>${vpdStr}</strong><br/>
              Nearest facility: <strong>${facility_area_code || "—"}</strong><br/>
              <em style="color:#6b7280;font-size:0.75em">Right-click to add facility here</em>`;
 
@@ -512,7 +518,7 @@ export default function MapView({
       });
 
       // 3. Unassigned areas — pink squares (areas not served by any facility).
-      unassignedAreas.forEach(({ census_area_id, area_code, name, x, y }) => {
+      unassignedAreas.forEach(({ census_area_id, area_code, name, x, y, demand, nearest_facility_code, nearest_facility_travel_time_min, nearest_facility_distance_km, travel_speed_kmh, avg_speed_kmh }) => {
         if (!x || !y) return;
         const isAdded = added.has(census_area_id);
         const el = document.createElement("div");
@@ -540,6 +546,12 @@ export default function MapView({
              <em style="color:#6b7280;font-size:0.75em">Right-click to cancel addition</em>`
           : `<strong>Unassigned Area</strong><br/>
              ${displayName}<br/>
+             ${demand != null ? `Demand: <strong>${demand.toLocaleString()}</strong><br/>` : ""}
+             ${nearest_facility_code ? `Nearest facility: <strong>${nearest_facility_code}</strong><br/>` : ""}
+             ${nearest_facility_travel_time_min != null ? `Travel time: <strong>${nearest_facility_travel_time_min.toFixed(1)} min</strong><br/>` : ""}
+             ${nearest_facility_distance_km != null ? `Distance: <strong>${nearest_facility_distance_km.toFixed(1)} km</strong><br/>` : ""}
+             ${travel_speed_kmh != null ? `Speed: <strong>${travel_speed_kmh} km/h</strong><br/>` : ""}
+             ${avg_speed_kmh != null ? `Avg. area speed (vpd): <strong>${Number(avg_speed_kmh).toFixed(1)} km/h</strong><br/>` : ""}
              <em style="color:#6b7280;font-size:0.75em">Not covered — right-click to add facility here</em>`;
 
         const popup = new maplibregl.Popup({ offset: 8 }).setHTML(popupHtml);
@@ -575,8 +587,9 @@ export default function MapView({
 
       facilities.forEach((facility, idx) => {
         if (!facility.x || !facility.y) return;
-        const isExisting = facility.is_existing;
-        const isRemoved  = removed.has(facility.census_area_id);
+        const isExisting  = facility.is_existing;
+        const isUserAdded = facility.is_user_added;
+        const isRemoved   = removed.has(facility.census_area_id);
 
         // Compute population-weighted average access time from served areas.
         const servedAreas = facility.served_areas || [];
@@ -608,21 +621,26 @@ export default function MapView({
         } else {
           el.style.cssText = `
             width: 20px; height: 20px;
-            background: ${isExisting ? "#16a34a" : "#2563eb"};
+            background: ${isUserAdded ? "#16a34a" : isExisting ? "#16a34a" : "#2563eb"};
             border: 3px solid #fff; border-radius: 50%;
             box-shadow: 0 2px 6px rgba(0,0,0,0.4); cursor: pointer;
           `;
         }
 
+        const facVpdStr = facility.avg_speed_kmh != null
+          ? `${Number(facility.avg_speed_kmh).toFixed(1)} km/h`
+          : "—";
+
         const popupHtml = isRemoved
           ? `<strong>Facility ${idx + 1} — Marked for removal</strong><br/>
              ${facility.name || facility.area_code}<br/>
              <em style="color:#6b7280;font-size:0.75em">Right-click to restore</em>`
-          : `<strong>Facility ${idx + 1}${isExisting ? " (existing)" : ""}</strong><br/>
+          : `<strong>Facility ${idx + 1}${isUserAdded ? " (user added)" : isExisting ? " (existing)" : ""}</strong><br/>
              ${facility.name || facility.area_code}<br/>
              Demand: <strong>${(facility.covered_demand || 0).toLocaleString()}</strong><br/>
              Max access: <strong>${maxTime}</strong><br/>
              Avg access: <strong>${avgTime}</strong><br/>
+             Avg. area speed (vpd): <strong>${facVpdStr}</strong><br/>
              <em style="color:#6b7280;font-size:0.75em">Right-click to remove</em>`;
 
         const popup = new maplibregl.Popup({ offset: 14 }).setHTML(popupHtml);

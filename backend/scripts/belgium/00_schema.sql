@@ -16,7 +16,6 @@ CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;
 
 -- 3. ENUMs
 CREATE TYPE facility_status   AS ENUM ('existing','proposed','optimized');
-CREATE TYPE intervention_type AS ENUM ('puntual','lineal','poligonal');
 CREATE TYPE model_type        AS ENUM ('p_median','p_center','max_coverage');
 CREATE TYPE scenario_status   AS ENUM ('pending','running','completed','failed');
 
@@ -72,15 +71,6 @@ CREATE TABLE distance_matrix (
 );
 CREATE INDEX idx_dist_from ON distance_matrix (from_area_id);
 CREATE INDEX idx_dist_to   ON distance_matrix (to_area_id);
-
--- raster_distance_matrix (optional, same layout as Ecuador)
-CREATE TABLE raster_distance_matrix (
-    from_area_id        INTEGER NOT NULL,
-    to_area_id          INTEGER NOT NULL,
-    travel_time_minutes FLOAT   NOT NULL
-);
-CREATE INDEX rdm_from_idx ON raster_distance_matrix (from_area_id);
-CREATE INDEX rdm_to_idx   ON raster_distance_matrix (to_area_id);
 
 -- 7. facility_types lookup
 CREATE TABLE facility_types (
@@ -141,15 +131,3 @@ CREATE TABLE optimization_results (
 CREATE INDEX idx_result_scenario ON optimization_results (scenario_id);
 CREATE INDEX idx_result_area     ON optimization_results (census_area_id);
 
--- 11. interventions
-CREATE TABLE interventions (
-    id                  SERIAL              PRIMARY KEY,
-    name                VARCHAR(255)        NOT NULL,
-    intervention_type   intervention_type   NOT NULL DEFAULT 'puntual',
-    facility_type       VARCHAR(50)         REFERENCES facility_types(code),
-    estimated_cost      FLOAT               NOT NULL DEFAULT 0.0,
-    parameters          JSONB,
-    geom                GEOMETRY,
-    created_at          TIMESTAMPTZ         NOT NULL DEFAULT NOW()
-);
-CREATE INDEX idx_intervention_geom ON interventions USING GIST (geom);

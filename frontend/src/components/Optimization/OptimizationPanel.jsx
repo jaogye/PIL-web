@@ -274,10 +274,11 @@ export default function OptimizationPanel({ onResultsReady, onRebalancingResult,
         k_vec:       form.k_vec       !== "" ? Number(form.k_vec)       : 100,
       };
     } else {
-      payload.p_facilities = Number(form.p_facilities);
       if (form.model_type === "max_coverage") {
+        delete payload.p_facilities;
         payload.service_radius = Number(form.service_radius);
       } else {
+        payload.p_facilities = Number(form.p_facilities);
         delete payload.service_radius;
       }
       if (form.min_capacity !== "") payload.min_capacity = Number(form.min_capacity);
@@ -488,8 +489,8 @@ export default function OptimizationPanel({ onResultsReady, onRebalancingResult,
           </>
         )}
 
-        {/* p (p-median / p-center / max_coverage — not bump_hunter) */}
-        {form.model_type !== "bump_hunter" && (
+        {/* p (p-median / p-center — not bump_hunter or max_coverage) */}
+        {form.model_type !== "bump_hunter" && form.model_type !== "max_coverage" && (
           <>
             <label style={labelStyle}>Number of Facilities (p)</label>
             <input
@@ -667,12 +668,12 @@ export default function OptimizationPanel({ onResultsReady, onRebalancingResult,
           </ul>
           {runData.scenario_id && (
             <div style={{ marginTop: "0.75rem", display: "flex", gap: "0.5rem" }}>
-              <a href={reportsApi.excelUrl(runData.scenario_id)} style={linkBtnStyle("#16a34a")}>
+              <button onClick={() => reportsApi.downloadExcel(runData.scenario_id, selectedDb)} style={linkBtnStyle("#16a34a")}>
                 Download Excel
-              </a>
-              <a href={reportsApi.jsonUrl(runData.scenario_id)} style={linkBtnStyle("#374151")}>
+              </button>
+              <button onClick={() => reportsApi.downloadJson(runData.scenario_id, selectedDb)} style={linkBtnStyle("#374151")}>
                 Download JSON
-              </a>
+              </button>
             </div>
           )}
         </div>

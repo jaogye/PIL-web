@@ -7,7 +7,9 @@ import { useState, useRef, useEffect } from "react";
 import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from "@tanstack/react-query";
 import MapView from "./components/Map/MapView";
 import OptimizationPanel from "./components/Optimization/OptimizationPanel";
-import { infrastructureApi, databasesApi, optimizationApi, setDatabase } from "./services/api";
+import LoginPage from "./components/Auth/LoginPage";
+import AdminPanel from "./components/Admin/AdminPanel";
+import { infrastructureApi, optimizationApi, setDatabase, authApi, tokenStore } from "./services/api";
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: 1, staleTime: 30_000 } },
@@ -38,14 +40,22 @@ function lsSaveReopt(id, data, facilityType, mode, payload) {
   } catch (_) { /* quota exceeded */ }
 }
 
-function AppInner() {
+function AppInner({ currentUser, onLogout }) {
   const qc = useQueryClient();
+  const [showAdmin, setShowAdmin] = useState(false);
+
+  // Databases accessible to this user come directly from the login/me response.
+  const databases = currentUser.accessible_databases || [];
+  const defaultDb = databases[0]?.db_name ?? "lip2_ecuador";
 
   const [optimizationResult, setOptimizationResult] = useState(null);
   const [facilityType, setFacilityType]             = useState(null);
   const [planningMode, setPlanningMode]             = useState(null);
-  const [selectedDb,   setSelectedDb]               = useState("lip2_ecuador");
+  const [selectedDb,   setSelectedDb]               = useState(defaultDb);
   const [panelKey,     setPanelKey]                 = useState(0); // forces OptimizationPanel remount on DB change
+
+  // Sync the axios client header with the user's default accessible database on mount.
+  useEffect(() => { setDatabase(defaultDb); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Rebalancing state ──
   const [rebalancingTransfers, setRebalancingTransfers] = useState(null);
@@ -75,12 +85,6 @@ function AppInner() {
   useEffect(() => () => clearTimeout(reoptimizePollRef.current), []);
 
   // ── Database switcher ──
-  const { data: databases = [] } = useQuery({
-    queryKey: ["databases"],
-    queryFn: databasesApi.list,
-    staleTime: Infinity,
-  });
-
   const handleDbChange = (dbName) => {
     setDatabase(dbName);
     setSelectedDb(dbName);
@@ -189,11 +193,20 @@ function AppInner() {
     } else {
       // All facilities the user has kept (not explicitly removed) become fixed.
       // The solver is skipped; a constrained nearest-assignment runs instead.
-      const keptIds = (optimizationResult.facility_locations || [])
-        .filter((f) => !userEdits.removed.has(f.census_area_id))
+      const keptFacilities = (optimizationResult.facility_locations || [])
+        .filter((f) => !userEdits.removed.has(f.census_area_id));
+      const keptIds = keptFacilities.map((f) => f.census_area_id);
+
+      // Carry forward is_user_added from previous reoptimization rounds so that
+      // green facilities stay green across multiple consecutive reoptimizations.
+      const prevUserAddedIds = keptFacilities
+        .filter((f) => f.is_user_added)
         .map((f) => f.census_area_id);
-      const newFacilityIds = Array.from(userEdits.added);
-      const fixedIds = Array.from(new Set([...keptIds, ...newFacilityIds]));
+
+      const newFacilityIds = Array.from(
+        new Set([...prevUserAddedIds, ...Array.from(userEdits.added)])
+      );
+      const fixedIds = Array.from(new Set([...keptIds, ...Array.from(userEdits.added)]));
       const baseP = optimizationResult.p_facilities ?? fixedIds.length;
       const newP = Math.min(200, Math.max(baseP, fixedIds.length));
       payload = {
@@ -202,8 +215,8 @@ function AppInner() {
         p_facilities: newP,
         mode: "from_scratch",
         fixed_census_area_ids: fixedIds,
-        // User-created facilities need different assignment rules (radius for
-        // max_coverage; no cap_min floor since they start empty).
+        // User-created facilities (new this round + carried over from prior rounds)
+        // need different assignment rules (radius for max_coverage; no cap_min floor).
         reopt_new_facility_ids: newFacilityIds.length > 0 ? newFacilityIds : undefined,
       };
     }
@@ -227,6 +240,9 @@ function AppInner() {
 
   return (
     <div style={{ display: "flex", height: "100vh", overflow: "hidden" }}>
+      {showAdmin && (
+        <AdminPanel currentUser={currentUser} onClose={() => setShowAdmin(false)} />
+      )}
 
       {/* ── Sidebar ── */}
       <aside style={sidebarStyle}>
@@ -247,9 +263,21 @@ function AppInner() {
               </select>
             )}
           </div>
-          <span style={{ fontSize: "0.75rem", color: "#6b7280", marginTop: "2px" }}>
-            Public Infrastructure Locator
-          </span>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "4px" }}>
+            <span style={{ fontSize: "0.72rem", color: "#6b7280" }}>
+              {currentUser?.email}
+            </span>
+            <div style={{ display: "flex", gap: "4px" }}>
+              {currentUser?.is_admin && (
+                <button onClick={() => setShowAdmin(true)} style={headerMicroBtnStyle("#dbeafe","#1d4ed8")}>
+                  ⚙ Admin
+                </button>
+              )}
+              <button onClick={onLogout} style={headerMicroBtnStyle("#fee2e2","#b91c1c")}>
+                Logout
+              </button>
+            </div>
+          </div>
         </div>
 
         {/* Panel content */}
@@ -409,9 +437,41 @@ function AppInner() {
 }
 
 export default function App() {
+  const [currentUser, setCurrentUser] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+
+  // Detect ?reset_token= in URL for password-reset flow.
+  const resetToken = new URLSearchParams(window.location.search).get("reset_token");
+
+  useEffect(() => {
+    if (resetToken) { setAuthChecked(true); return; }
+    const token = tokenStore.get();
+    if (!token) { setAuthChecked(true); return; }
+    authApi.me()
+      .then((user) => { setCurrentUser(user); setAuthChecked(true); })
+      .catch(() => { tokenStore.clear(); setAuthChecked(true); });
+  }, []);
+
+  const handleLogin = (userData) => {
+    setCurrentUser(userData);
+    // Clear reset_token from URL without reload.
+    window.history.replaceState({}, "", "/");
+  };
+
+  const handleLogout = () => {
+    tokenStore.clear();
+    setCurrentUser(null);
+  };
+
+  if (!authChecked) return null; // avoid flash before token validation
+
+  if (resetToken || !currentUser) {
+    return <LoginPage onLogin={handleLogin} resetToken={resetToken} />;
+  }
+
   return (
     <QueryClientProvider client={queryClient}>
-      <AppInner />
+      <AppInner currentUser={currentUser} onLogout={handleLogout} />
     </QueryClientProvider>
   );
 }
@@ -437,6 +497,17 @@ const headerStyle = {
   borderBottom: "1px solid #f3f4f6",
   background: "#f8fafc",
 };
+
+const headerMicroBtnStyle = (bg, color) => ({
+  fontSize: "0.7rem",
+  fontWeight: 600,
+  padding: "2px 7px",
+  background: bg,
+  color,
+  border: "none",
+  borderRadius: "4px",
+  cursor: "pointer",
+});
 
 const dbSelectStyle = {
   fontSize: "0.78rem",

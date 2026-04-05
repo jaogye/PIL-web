@@ -253,12 +253,14 @@ def solve(
         total_demand,
     )
 
+
     # ── Phase 2B: Prune redundant facilities ──────────────────────────────── #
+    # NOTE: Phase 2B is temporarily disabled to observe raw Phase 1 placement.
     n_before_prune = len(selected) - n_pre
     if len(selected) > n_pre:
         logger.info(
             "CMCLP DEBUG Phase 2B start: %d new facilities to evaluate for pruning",
-            n_before_prune,
+         n_before_prune,
         )
         _phase2b_prune(
             dm, demand, remaining, selected, selected_set,
@@ -385,6 +387,42 @@ def _update_momentum(
         momentum[dm.csc_row[s:e]] -= delta * csc_speeds[s:e]
 
 
+def _find_peripheral_candidate(
+    dm: "SparseDistanceMatrix",
+    valid_mask: np.ndarray,
+    momentum: np.ndarray,
+    remaining: np.ndarray,
+    r16: np.uint16,
+    cap_min_f: float,
+    cap_max_f: float,
+) -> tuple[int, float, list]:
+    """Exhaustive peripheral search for equity_ratio == 0 MIN turns.
+
+    Scans all valid candidates in ascending momentum order until one satisfies
+    cap_min.  This ensures a facility is placed in the most remote feasible zone
+    even when the most isolated candidates are too sparse.
+
+    Returns (best_j, load, taken).  best_j == -1 when no feasible candidate exists.
+    """
+    tried = np.zeros(dm.n, dtype=bool)
+    best_j = -1
+    load, taken = 0.0, []
+    while True:
+        search_mask = valid_mask & ~tried
+        if not np.any(search_mask):
+            break
+        mom_masked = np.where(search_mask, momentum, np.inf)
+        candidate = int(np.argmin(mom_masked))
+        tried[candidate] = True
+        load, taken = _zone_nearest_to_capmin(
+            dm, remaining, candidate, r16, cap_min_f, cap_max_f
+        )
+        if load >= cap_min_f - 1e-9:
+            best_j = candidate
+            break
+    return best_j, load, taken
+
+
 # ─────────────────────────────────────────────────────────────────────────── #
 # Phase 1 – momentum-based alternating greedy                                  #
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -439,31 +477,57 @@ def _phase1_momentum(
         is_max_turn = (turn_in_cycle < equity_ratio)
         turn_type = "MAX" if is_max_turn else "MIN"
 
-        if is_max_turn:
-            mom_masked = np.where(valid_mask, momentum, -np.inf)
-            best_j = int(np.argmax(mom_masked))
-        else:
-            mom_masked = np.where(valid_mask, momentum, np.inf)
-            best_j = int(np.argmin(mom_masked))
-
-        best_score = float(effective[best_j])
-        best_mom = float(momentum[best_j])
-
-        # Nearest-first fill up to cap_min.
-        load, taken = _zone_nearest_to_capmin(dm, remaining, best_j, r16, cap_min_f, cap_max_f)
-
-        if load < cap_min_f - 1e-9:
-            consecutive_no_valid += 1
-            logger.warning(
-                "CMCLP DEBUG turn %d (%s): fill FAILED  j=%d score=%.1f mom=%.4f "
-                "fill_load=%.1f cap_min=%.1f n_taken=%d n_valid=%d  "
-                "consecutive_fails=%d",
-                turn_number, turn_type, best_j, best_score, best_mom,
-                load, cap_min_f, len(taken), n_valid, consecutive_no_valid,
+        # ── Candidate selection ────────────────────────────────────────── #
+        # equity_ratio == 0: pure peripheral mode.
+        # Instead of stopping after 2 consecutive fill failures, scan ALL
+        # valid candidates in ascending momentum order until one satisfies
+        # cap_min.  This ensures a facility is placed in the most remote
+        # feasible zone even when the most isolated candidates are too sparse.
+        if not is_max_turn and equity_ratio == 0:
+            best_j, load, taken = _find_peripheral_candidate(
+                dm, valid_mask, momentum, remaining, r16, cap_min_f, cap_max_f
             )
-            turn_in_cycle = (turn_in_cycle + 1) % cycle_len
-            turn_number += 1
-            continue
+
+            if best_j == -1:
+                logger.info(
+                    "CMCLP DEBUG equity exhaustive search: all valid candidates "
+                    "tried, none satisfies cap_min=%.1f  (placed=%d, turn=%d)",
+                    cap_min_f, len(new_opened), turn_number,
+                )
+                break  # no feasible peripheral facility exists — stop Phase 1
+
+            logger.debug(
+                "  CMCLP Phase 1 (MIN-exhaustive): opened facility %d  load=%.1f",
+                best_j, load,
+            )
+        else:
+            # Standard MAX or MIN turn (equity_ratio > 0).
+            if is_max_turn:
+                mom_masked = np.where(valid_mask, momentum, -np.inf)
+                best_j = int(np.argmax(mom_masked))
+            else:
+                mom_masked = np.where(valid_mask, momentum, np.inf)
+                best_j = int(np.argmin(mom_masked))
+
+            best_score = float(effective[best_j])
+            best_mom   = float(momentum[best_j])
+
+            load, taken = _zone_nearest_to_capmin(
+                dm, remaining, best_j, r16, cap_min_f, cap_max_f
+            )
+
+            if load < cap_min_f - 1e-9:
+                consecutive_no_valid += 1
+                logger.warning(
+                    "CMCLP DEBUG turn %d (%s): fill FAILED  j=%d score=%.1f mom=%.4f "
+                    "fill_load=%.1f cap_min=%.1f n_taken=%d n_valid=%d  "
+                    "consecutive_fails=%d",
+                    turn_number, turn_type, best_j, best_score, best_mom,
+                    load, cap_min_f, len(taken), n_valid, consecutive_no_valid,
+                )
+                turn_in_cycle = (turn_in_cycle + 1) % cycle_len
+                turn_number += 1
+                continue
 
         consecutive_no_valid = 0
         turn_in_cycle = (turn_in_cycle + 1) % cycle_len
@@ -605,6 +669,60 @@ def _zone_nearest_to_capmin(
     return load, taken
 
 
+def _can_reassign_facility(
+    dm: "SparseDistanceMatrix",
+    fac: int,
+    demand: np.ndarray,
+    served: list[int],
+    fac_remaining: dict[int, float],
+    selected_set: set[int],
+    radius: float,
+    cap_max_f: float,
+) -> tuple[bool, dict[int, int]]:
+    """Check whether all areas served by fac can be feasibly reassigned to neighbours.
+
+    Areas are processed in descending demand order so that the heaviest areas
+    claim capacity first.  Remaining capacity is tracked speculatively without
+    mutating fac_remaining.
+
+    Returns (feasible, reassign) where reassign maps area -> alternative facility
+    (or -1 for zero-demand areas).  If feasible is False, reassign is partial.
+    """
+    temp_remaining_cap: dict[int, float] = dict(fac_remaining)
+    reassign: dict[int, int] = {}
+    feasible = True
+
+    for area in sorted(served, key=lambda a: float(demand[a]), reverse=True):
+        dem = float(demand[area])
+        if dem <= 1e-9:
+            reassign[area] = -1
+            continue
+
+        best_alt = -1
+        best_dist = math.inf
+        for g in selected_set:
+            if g == fac:
+                continue
+            d = dm.distance_time(area, g)
+            if d > radius:
+                continue
+            cap_left = temp_remaining_cap.get(g, 0.0)
+            if cap_left < dem - 1e-9:
+                continue
+            if d < best_dist:
+                best_dist = d
+                best_alt = g
+
+        if best_alt == -1:
+            feasible = False
+            break
+
+        reassign[area] = best_alt
+        temp_remaining_cap[best_alt] -= dem
+
+    return feasible, reassign
+
+
 # ─────────────────────────────────────────────────────────────────────────── #
 # Phase 2B – Prune facilities whose demand can be absorbed by neighbours       #
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -662,37 +780,9 @@ def _phase2b_prune(
                 changed = True
                 break
 
-            temp_remaining_cap: dict[int, float] = dict(fac_remaining)
-            reassign: dict[int, int] = {}
-            feasible = True
-
-            for area in sorted(served, key=lambda a: float(demand[a]), reverse=True):
-                dem = float(demand[area])
-                if dem <= 1e-9:
-                    reassign[area] = -1
-                    continue
-
-                best_alt = -1
-                best_dist = math.inf
-                for g in selected_set:
-                    if g == fac:
-                        continue
-                    d = dm.distance_time(area, g)
-                    if d > radius:
-                        continue
-                    cap_left = temp_remaining_cap.get(g, 0.0)
-                    if cap_left < dem - 1e-9:
-                        continue
-                    if d < best_dist:
-                        best_dist = d
-                        best_alt = g
-
-                if best_alt == -1:
-                    feasible = False
-                    break
-
-                reassign[area] = best_alt
-                temp_remaining_cap[best_alt] -= dem
+            feasible, reassign = _can_reassign_facility(
+                dm, fac, demand, served, fac_remaining, selected_set, radius, cap_max
+            )
 
             if not feasible:
                 continue
@@ -715,7 +805,7 @@ def _phase2b_prune(
             )
             changed = True
             break
-
+    
 
 def _remove_facility(
     fac: int,

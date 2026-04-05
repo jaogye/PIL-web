@@ -3,16 +3,23 @@ REST endpoints for report generation.
 
 GET /reports/scenario/{id}/excel  – Download a scenario report as .xlsx
 GET /reports/scenario/{id}/json   – Download full scenario data as JSON
+
+Both endpoints accept an optional ?db= query parameter to select the target
+database (e.g. ?db=lip2_belgium).  This is needed because the download links
+are plain <a href> tags that cannot send the X-LIP2-Database header.
 """
 
 import io
+import json
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
+from app.database import get_session_factory
 from app.dependencies import get_db, get_db_name
 from app.models.census import CensusArea
 from app.models.optimization import OptimizationResult, OptimizationScenario
@@ -20,9 +27,36 @@ from app.models.optimization import OptimizationResult, OptimizationScenario
 router = APIRouter(prefix="/reports", tags=["reports"])
 
 
+async def _resolve_db(
+    db_query: str | None,
+    db_from_header: AsyncSession,
+) -> AsyncSession:
+    """
+    Return the correct async session.
+
+    Priority: ?db= query param > X-LIP2-Database header > default database.
+    When the query param is present a new session is opened directly; the
+    caller is responsible for closing it.
+    """
+    if db_query is None:
+        return db_from_header, False   # (session, owned_by_us)
+
+    available = get_settings().available_databases
+    if db_query not in available:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown database '{db_query}'. Available: {available}",
+        )
+    factory = get_session_factory(db_query)
+    session = factory()
+    return session, True   # (session, owned_by_us)
+
+
 @router.get("/scenario/{scenario_id}/excel")
 async def export_scenario_excel(
-    scenario_id: int, db: AsyncSession = Depends(get_db)
+    scenario_id: int,
+    db_query: str | None = Query(default=None, alias="db"),
+    db: AsyncSession = Depends(get_db),
 ):
     """Export scenario results as an Excel workbook (.xlsx)."""
     try:
@@ -31,29 +65,33 @@ async def export_scenario_excel(
     except ImportError:
         raise HTTPException(status_code=500, detail="openpyxl is not installed")
 
-    scenario = await db.get(OptimizationScenario, scenario_id)
-    if not scenario:
-        raise HTTPException(status_code=404, detail="Scenario not found")
+    session, owned = await _resolve_db(db_query, db)
+    try:
+        scenario = await session.get(OptimizationScenario, scenario_id)
+        if not scenario:
+            raise HTTPException(status_code=404, detail="Scenario not found")
 
-    res = await db.execute(
-        select(OptimizationResult, CensusArea)
-        .join(CensusArea, OptimizationResult.census_area_id == CensusArea.id)
-        .where(OptimizationResult.scenario_id == scenario_id)
-    )
-    rows = res.all()
-
-    # Pre-load all census areas for the served-areas sheet.
-    # served_area_ids format: [[census_area_id, demand_amount], ...]
-    all_area_ids: set[int] = set()
-    for opt_res, _ in rows:
-        for entry in (opt_res.served_area_ids or []):
-            all_area_ids.add(int(entry[0]) if isinstance(entry, (list, tuple)) else int(entry))
-    area_map: dict[int, CensusArea] = {}
-    if all_area_ids:
-        area_res = await db.execute(
-            select(CensusArea).where(CensusArea.id.in_(list(all_area_ids)))
+        res = await session.execute(
+            select(OptimizationResult, CensusArea)
+            .join(CensusArea, OptimizationResult.census_area_id == CensusArea.id)
+            .where(OptimizationResult.scenario_id == scenario_id)
         )
-        area_map = {a.id: a for a in area_res.scalars().all()}
+        rows = res.all()
+
+        # Pre-load census areas for the served-areas sheet.
+        all_area_ids: set[int] = set()
+        for opt_res, _ in rows:
+            for entry in (opt_res.served_area_ids or []):
+                all_area_ids.add(int(entry[0]) if isinstance(entry, (list, tuple)) else int(entry))
+        area_map: dict[int, CensusArea] = {}
+        if all_area_ids:
+            area_res = await session.execute(
+                select(CensusArea).where(CensusArea.id.in_(list(all_area_ids)))
+            )
+            area_map = {a.id: a for a in area_res.scalars().all()}
+    finally:
+        if owned:
+            await session.close()
 
     wb = openpyxl.Workbook()
 
@@ -79,8 +117,7 @@ async def export_scenario_excel(
         ws_summary.append(["── Statistics ──"])
         for key, value in scenario.result_stats.items():
             if key.startswith("_"):
-                continue  # skip internal keys (_meta, _locations, etc.)
-            # Ensure value is a scalar that openpyxl can handle.
+                continue
             if not isinstance(value, (int, float, str, bool, type(None))):
                 value = str(value)
             ws_summary.append([key.replace("_", " ").title(), value])
@@ -90,10 +127,9 @@ async def export_scenario_excel(
 
     # --- Sheet 2: Facility Locations ---
     ws_fac = wb.create_sheet("Facility Locations")
-    headers = ["#", "Area Code", "Area Name", "Province", "Canton", "Parish",
-               "X (Lon)", "Y (Lat)", "Demand Covered"]
-    ws_fac.append(headers)
-
+    fac_headers = ["#", "Area Code", "Area Name", "Province", "Canton", "Parish",
+                   "X (Lon)", "Y (Lat)", "Demand Covered"]
+    ws_fac.append(fac_headers)
     for cell in ws_fac[1]:
         cell.font = header_font
         cell.fill = header_fill
@@ -131,7 +167,6 @@ async def export_scenario_excel(
 
     for fac_num, (opt_res, fac_area) in enumerate(rows, start=1):
         for entry in (opt_res.served_area_ids or []):
-            # Support both old format (plain int) and new format ([area_id, demand]).
             if isinstance(entry, (list, tuple)):
                 aid, demand_amt = int(entry[0]), float(entry[1])
             else:
@@ -157,7 +192,6 @@ async def export_scenario_excel(
         max_len = max(len(str(cell.value or "")) for cell in col) + 2
         ws_served.column_dimensions[col[0].column_letter].width = min(max_len, 30)
 
-    # Serialize to bytes.
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
@@ -172,19 +206,26 @@ async def export_scenario_excel(
 
 @router.get("/scenario/{scenario_id}/json")
 async def export_scenario_json(
-    scenario_id: int, db: AsyncSession = Depends(get_db)
+    scenario_id: int,
+    db_query: str | None = Query(default=None, alias="db"),
+    db: AsyncSession = Depends(get_db),
 ):
     """Export full scenario data as a JSON download."""
-    scenario = await db.get(OptimizationScenario, scenario_id)
-    if not scenario:
-        raise HTTPException(status_code=404, detail="Scenario not found")
+    session, owned = await _resolve_db(db_query, db)
+    try:
+        scenario = await session.get(OptimizationScenario, scenario_id)
+        if not scenario:
+            raise HTTPException(status_code=404, detail="Scenario not found")
 
-    res = await db.execute(
-        select(OptimizationResult, CensusArea)
-        .join(CensusArea, OptimizationResult.census_area_id == CensusArea.id)
-        .where(OptimizationResult.scenario_id == scenario_id)
-    )
-    rows = res.all()
+        res = await session.execute(
+            select(OptimizationResult, CensusArea)
+            .join(CensusArea, OptimizationResult.census_area_id == CensusArea.id)
+            .where(OptimizationResult.scenario_id == scenario_id)
+        )
+        rows = res.all()
+    finally:
+        if owned:
+            await session.close()
 
     payload = {
         "scenario": {
@@ -212,8 +253,6 @@ async def export_scenario_json(
             for opt_res, area in rows
         ],
     }
-
-    import json
 
     content = json.dumps(payload, indent=2, ensure_ascii=False)
     filename = f"lip2_scenario_{scenario_id}.json"

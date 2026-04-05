@@ -77,7 +77,7 @@ class OptimizationRequest(BaseModel):
     @classmethod
     def p_required_for_non_bump(cls, v, info):
         model = info.data.get("model_type")
-        if model != ModelType.BUMP_HUNTER and v is None:
+        if model not in (ModelType.BUMP_HUNTER, ModelType.MAX_COVERAGE) and v is None:
             raise ValueError("p_facilities is required for this model type")
         return v
 
@@ -102,6 +102,7 @@ class ServedAreaInfo(BaseModel):
     y: float | None = None
     assigned_demand: float
     travel_time: float | None = None  # travel time in minutes from this area to its facility
+    avg_speed_kmh: float | None = None  # stored vpd for this census area
 
 
 class FacilityLocation(BaseModel):
@@ -113,8 +114,11 @@ class FacilityLocation(BaseModel):
     covered_demand: float | None
     assigned_areas: int | None
     max_travel_time: float | None
-    # True when this facility was pre-selected as an existing facility.
+    avg_speed_kmh: float | None = None  # stored vpd for the facility census area
+    # True when this facility came from the infrastructure database (complete_existing mode).
     is_existing: bool = False
+    # True when this facility was manually added by the user during reoptimization.
+    is_user_added: bool = False
     # Census areas served by this facility (for map service-area visualization).
     served_areas: list[ServedAreaInfo] = []
 
@@ -126,6 +130,12 @@ class UnassignedAreaInfo(BaseModel):
     name: str | None = None
     x: float | None = None
     y: float | None = None
+    demand: float | None = None
+    nearest_facility_code: str | None = None
+    nearest_facility_travel_time_min: float | None = None
+    nearest_facility_distance_km: float | None = None
+    travel_speed_kmh: float | None = None  # speed computed on-the-fly to nearest facility
+    avg_speed_kmh: float | None = None      # stored vpd for this census area
 
 
 class OptimizationResponse(BaseModel):

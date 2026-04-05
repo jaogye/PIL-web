@@ -137,7 +137,7 @@ class SparseDistanceMatrix:
         Returns (row_indices int32, distances float64 minutes).
         """
         r_val = float(min(radius, MAX_DIST))
-
+        
         # Stored neighbors within radius.
         s, e = int(self.csc_ptr[j]), int(self.csc_ptr[j + 1])
         stored_rows = self.csc_row[s:e]
@@ -145,7 +145,7 @@ class SparseDistanceMatrix:
         in_zone = stored_vals <= r_val
         stored_in_rows = stored_rows[in_zone]
         stored_in_dists = stored_vals[in_zone]
-
+        
         if self.xy is None or self.speeds is None:
             return stored_in_rows, stored_in_dists
 
