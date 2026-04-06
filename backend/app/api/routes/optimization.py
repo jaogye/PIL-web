@@ -791,8 +791,17 @@ async def _run_optimization_bg(
 
             else:
                 # Standard path: run the solver then capacity-constrain the assignment.
+                # In COMPLETE_EXISTING mode p means "additional facilities to place
+                # on top of existing ones", so the solver receives the combined total.
+                effective_p = payload.p_facilities
+                if (
+                    payload.mode == OptimizationMode.COMPLETE_EXISTING
+                    and pre_selected
+                ):
+                    effective_p = len(pre_selected) + payload.p_facilities
+
                 facility_indices, stats = await asyncio.to_thread(
-                    _run_solver, payload, demand, distance_matrix, pre_selected
+                    _run_solver, payload, demand, distance_matrix, pre_selected, effective_p
                 )
                 _timing["6_solver"] = time.perf_counter() - _t
 
@@ -940,6 +949,7 @@ async def _run_optimization_bg(
                 "facility_type": payload.facility_type or "high_school",
                 "mode": payload.mode.value,
                 "target_population_id": payload.target_population_id,
+                "scope_filters": payload.scope_filters.model_dump() if payload.scope_filters else None,
             }
 
             # 11.5 Compute unassigned areas (scope areas with demand > 0 not served
@@ -1233,14 +1243,21 @@ def _run_solver(
     demand: np.ndarray,
     distance_matrix: SparseDistanceMatrix,
     pre_selected: list[int],
+    override_p: int | None = None,
 ) -> tuple[list[int], dict]:
-    """Dispatch to the appropriate solver and return (facility_indices, stats)."""
+    """Dispatch to the appropriate solver and return (facility_indices, stats).
+
+    override_p, when provided, replaces payload.p_facilities as the total
+    facility count passed to the solver. Used for COMPLETE_EXISTING mode where
+    the effective p = len(existing) + p_new.
+    """
     model = payload.model_type.value
+    p = override_p if override_p is not None else payload.p_facilities
 
     if model == "p_median":
         max_exchange = 0 if distance_matrix.n > 5_000 else 50
         result = p_median_solve(
-            distance_matrix, demand, payload.p_facilities,
+            distance_matrix, demand, p,
             max_exchange_iters=max_exchange,
             pre_selected=pre_selected or None,
         )
@@ -1249,7 +1266,7 @@ def _run_solver(
 
     if model == "p_center":
         result = p_center_solve(
-            distance_matrix, demand, payload.p_facilities,
+            distance_matrix, demand, p,
             pre_selected=pre_selected or None,
         )
         result.coverage_stats["num_facilities"] = len(result.facility_indices)
@@ -1257,7 +1274,7 @@ def _run_solver(
 
     if model == "max_coverage":
         result = max_coverage_solve(
-            distance_matrix, demand, payload.p_facilities, payload.service_radius,
+            distance_matrix, demand, p, payload.service_radius,
             cap_min=float(payload.min_capacity) if payload.min_capacity else 0.0,
             cap_max=float(payload.max_capacity) if payload.max_capacity else None,
             pre_selected=pre_selected or None,

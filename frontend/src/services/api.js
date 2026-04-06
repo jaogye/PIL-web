@@ -23,6 +23,9 @@ const client = axios.create({
     "Content-Type": "application/json",
     "X-LIP2-Database": "lip2_ecuador",
   },
+  // Serialize array params as repeated keys (?ids=1&ids=2) so FastAPI
+  // Query(list[int]) receives them correctly instead of ?ids[]=1&ids[]=2.
+  paramsSerializer: { indexes: null },
 });
 
 /** Attach the stored JWT to every request. */

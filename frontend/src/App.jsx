@@ -98,10 +98,19 @@ function AppInner({ currentUser, onLogout }) {
   };
 
   // ── Existing facilities query ──
+  // scope_filters are stored in stats._meta after each optimization run so
+  // that the infrastructure query can be scoped to the selected territory.
+  const scopeParishIds =
+    optimizationResult?.stats?._meta?.scope_filters?.parish_ids ?? null;
+
   const { data: existingFacilities = [] } = useQuery({
-    queryKey: ["existing-facilities", facilityType],
+    queryKey: ["existing-facilities", facilityType, scopeParishIds],
     queryFn: () =>
-      infrastructureApi.list({ facility_type: facilityType, status: "existing" }),
+      infrastructureApi.list({
+        facility_type: facilityType,
+        status: "existing",
+        ...(scopeParishIds ? { parish_ids: scopeParishIds } : {}),
+      }),
     enabled: !!facilityType,
   });
 

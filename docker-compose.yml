@@ -4,6 +4,8 @@ services:
   db:
     image: imresamu/postgis:16-3.4
     restart: unless-stopped
+    ports:
+      - "5432:5432"
     environment:
       POSTGRES_USER: lip2
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -31,9 +33,7 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL}
       ADMIN_DATABASE: ${ADMIN_DATABASE:-admin}
-      AVAILABLE_DATABASES: ${AVAILABLE_DATABASES:-'["lip2_ecuador","lip2_belgium"]'}
       DEBUG: ${DEBUG:-false}
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-'["http://localhost:5173","http://localhost:3000"]'}
       SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
     depends_on:

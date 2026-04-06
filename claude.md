@@ -2,3 +2,4 @@ Cada vez que te pida alguna tarea ya sea en ingles o español y si esta tarea no
 
 Los comentarios del codigo generado siempre deben ser en ingles. 
 
+Yo uso PowerShell para ejecutar comandos.

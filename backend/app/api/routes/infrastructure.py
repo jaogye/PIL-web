@@ -56,6 +56,7 @@ class FacilityOut(BaseModel):
 async def list_facilities(
     facility_type: FacilityType | None = Query(None),
     facility_status: FacilityStatus | None = Query(None, alias="status"),
+    parish_ids: list[int] | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     query = (
@@ -66,6 +67,8 @@ async def list_facilities(
         query = query.where(Facility.facility_type == facility_type)
     if facility_status:
         query = query.where(Facility.status == facility_status)
+    if parish_ids:
+        query = query.where(CensusArea.parish_id.in_(parish_ids))
 
     result = await db.execute(query)
     rows = result.all()
