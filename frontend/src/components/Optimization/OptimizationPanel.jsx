@@ -470,23 +470,19 @@ export default function OptimizationPanel({ onResultsReady, onRebalancingResult,
           </>
         )}
 
-        {form.model_type !== "bump_hunter" && (
-          <>
-            <label style={labelStyle}>Planning Mode</label>
-            <select
-              style={inputStyle}
-              value={form.mode}
-              onChange={(e) => setForm({ ...form, mode: e.target.value })}
-            >
-              <option value="from_scratch">From scratch</option>
-              <option value="complete_existing">Complete existing</option>
-            </select>
-            {form.mode === "complete_existing" && (
-              <p style={{ fontSize: "0.78rem", color: "#6b7280", marginBottom: "0.75rem" }}>
-                Existing facilities of the selected type will be fixed.
-              </p>
-            )}
-          </>
+        <label style={labelStyle}>Planning Mode</label>
+        <select
+          style={inputStyle}
+          value={form.mode}
+          onChange={(e) => setForm({ ...form, mode: e.target.value })}
+        >
+          <option value="from_scratch">From scratch</option>
+          <option value="complete_existing">Complete existing</option>
+        </select>
+        {form.mode === "complete_existing" && (
+          <p style={{ fontSize: "0.78rem", color: "#6b7280", marginBottom: "0.75rem" }}>
+            Existing facilities of the selected type will be fixed. Their capacity (from the DB) limits the demand they can absorb.
+          </p>
         )}
 
         {/* p (p-median / p-center — not bump_hunter or max_coverage) */}

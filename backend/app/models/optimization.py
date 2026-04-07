@@ -75,30 +75,30 @@ class OptimizationScenario(Base):
 
 class OptimizationResult(Base):
     __tablename__ = "optimization_results"
-
+    
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-
+    
     scenario_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("optimization_scenarios.id", ondelete="CASCADE"), nullable=False
     )
     scenario: Mapped[OptimizationScenario] = relationship(back_populates="results")
-
+    
     # Census area selected as a facility location.
     census_area_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("census_areas.id"), nullable=False
     )
-
+    
     # Demand covered by this specific facility.
     covered_demand: Mapped[float | None] = mapped_column(Float)
-
+    
     # Number of census areas assigned to this facility.
     assigned_areas: Mapped[int | None] = mapped_column(Integer)
-
+    
     # Maximum travel time from any assigned area to this facility.
     max_travel_time: Mapped[float | None] = mapped_column(Float)
-
+    
     # IDs of census areas served by this facility (for Excel sheet).
     served_area_ids: Mapped[list | None] = mapped_column(JSON)
-
+    
     def __repr__(self) -> str:
         return f"<OptimizationResult scenario={self.scenario_id} area={self.census_area_id}>"

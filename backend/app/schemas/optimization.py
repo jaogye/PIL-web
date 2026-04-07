@@ -55,6 +55,10 @@ class OptimizationRequest(BaseModel):
     min_capacity: float | None = Field(None, ge=0.0)
     max_capacity: float | None = Field(None, ge=0.0)
 
+    # Per-facility capacity overrides for user-added facilities during reoptimization.
+    # Keys are census_area_id (as string), values have min_capacity / max_capacity fields.
+    per_facility_capacity_overrides: dict[str, Any] | None = None
+
     # Reoptimization: exact list of census_area_ids to treat as fixed facilities.
     # When provided, the solver is skipped; a constrained nearest-assignment is
     # run directly over these facilities.  Overrides the complete_existing mode.
@@ -119,6 +123,8 @@ class FacilityLocation(BaseModel):
     is_existing: bool = False
     # True when this facility was manually added by the user during reoptimization.
     is_user_added: bool = False
+    # Raw DB capacity for existing facilities (complete_existing mode). None for new/optimized.
+    db_capacity: float | None = None
     # Census areas served by this facility (for map service-area visualization).
     served_areas: list[ServedAreaInfo] = []
 

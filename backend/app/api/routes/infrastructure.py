@@ -57,6 +57,9 @@ async def list_facilities(
     facility_type: FacilityType | None = Query(None),
     facility_status: FacilityStatus | None = Query(None, alias="status"),
     parish_ids: list[int] | None = Query(None),
+    province_codes: list[str] | None = Query(None),
+    canton_codes: list[str] | None = Query(None),
+    parish_codes: list[str] | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     query = (
@@ -67,8 +70,21 @@ async def list_facilities(
         query = query.where(Facility.facility_type == facility_type)
     if facility_status:
         query = query.where(Facility.status == facility_status)
+    # Geographic scope filters — parish_ids takes priority over code-based filters.
     if parish_ids:
         query = query.where(CensusArea.parish_id.in_(parish_ids))
+    elif province_codes:
+        query = query.where(CensusArea.province_code.in_(province_codes))
+        if canton_codes:
+            query = query.where(CensusArea.canton_code.in_(canton_codes))
+        if parish_codes:
+            query = query.where(CensusArea.parish_code.in_(parish_codes))
+    elif canton_codes:
+        query = query.where(CensusArea.canton_code.in_(canton_codes))
+        if parish_codes:
+            query = query.where(CensusArea.parish_code.in_(parish_codes))
+    elif parish_codes:
+        query = query.where(CensusArea.parish_code.in_(parish_codes))
 
     result = await db.execute(query)
     rows = result.all()

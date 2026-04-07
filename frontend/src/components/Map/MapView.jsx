@@ -168,6 +168,8 @@ export default function MapView({
   onFacilityContextMenu = null,
   onAreaContextMenu = null,
   rebalancingTransfers = null,
+  defaultMinCapacity = null,
+  defaultMaxCapacity = null,
 }) {
   const mapContainer      = useRef(null);
   const mapRef            = useRef(null);
@@ -572,8 +574,15 @@ export default function MapView({
           border: 2px solid #fff; border-radius: 50%;
           box-shadow: 0 2px 5px rgba(0,0,0,0.35); cursor: pointer;
         `;
+        const capStr = fac.capacity != null
+          ? (fac.capacity === 0
+              ? "No capacity (0)"
+              : Number(fac.capacity).toLocaleString())
+          : "—";
         const popup = new maplibregl.Popup({ offset: 12 }).setHTML(
-          `<strong>Existing</strong><br/>${fac.name || fac.facility_type}`
+          `<strong>Existing Facility</strong><br/>
+           ${fac.name || fac.facility_type}<br/>
+           Current capacity: <strong>${capStr}</strong>`
         );
         markersRef.current.push(
           new maplibregl.Marker({ element: el, anchor: "center" })
@@ -631,13 +640,20 @@ export default function MapView({
           ? `${Number(facility.avg_speed_kmh).toFixed(1)} km/h`
           : "—";
 
+        const dbCapStr = (() => {
+          if (!isExisting || facility.db_capacity == null) return null;
+          if (facility.db_capacity === 0) return "No capacity (0)";
+          return Number(facility.db_capacity).toLocaleString();
+        })();
+
         const popupHtml = isRemoved
           ? `<strong>Facility ${idx + 1} — Marked for removal</strong><br/>
              ${facility.name || facility.area_code}<br/>
              <em style="color:#6b7280;font-size:0.75em">Right-click to restore</em>`
           : `<strong>Facility ${idx + 1}${isUserAdded ? " (user added)" : isExisting ? " (existing)" : ""}</strong><br/>
              ${facility.name || facility.area_code}<br/>
-             Demand: <strong>${(facility.covered_demand || 0).toLocaleString()}</strong><br/>
+             Demand served: <strong>${(facility.covered_demand || 0).toLocaleString()}</strong><br/>
+             ${dbCapStr != null ? `Current capacity: <strong>${dbCapStr}</strong><br/>` : ""}
              Max access: <strong>${maxTime}</strong><br/>
              Avg access: <strong>${avgTime}</strong><br/>
              Avg. area speed (vpd): <strong>${facVpdStr}</strong><br/>
@@ -672,13 +688,32 @@ export default function MapView({
     setLayerVisibility(Object.fromEntries(LAYER_GROUPS.map((g) => [g.id, !allChecked])));
 
   const handleContextMenuAction = (e) => {
-    e.stopPropagation(); // prevent document click from closing the menu immediately
+    e.stopPropagation();
     if (!contextMenu) return;
     if (contextMenu.type === "facility") {
       onFacilityContextMenuRef.current?.(contextMenu.censusAreaId);
+      setContextMenu(null);
+    } else if (contextMenu.isEdited) {
+      // Cancel addition — no capacity needed.
+      onAreaContextMenuRef.current?.(contextMenu.censusAreaId, null, null);
+      setContextMenu(null);
     } else {
-      onAreaContextMenuRef.current?.(contextMenu.censusAreaId);
+      // First click on "Add Facility Here" → expand to capacity form.
+      setContextMenu((prev) => ({
+        ...prev,
+        showCapacityForm: true,
+        tempMinCap: defaultMinCapacity != null ? String(defaultMinCapacity) : "",
+        tempMaxCap: defaultMaxCapacity != null ? String(defaultMaxCapacity) : "",
+      }));
     }
+  };
+
+  const handleConfirmCapacity = (e) => {
+    e.stopPropagation();
+    if (!contextMenu) return;
+    const minCap = contextMenu.tempMinCap !== "" ? Number(contextMenu.tempMinCap) : null;
+    const maxCap = contextMenu.tempMaxCap !== "" ? Number(contextMenu.tempMaxCap) : null;
+    onAreaContextMenuRef.current?.(contextMenu.censusAreaId, minCap, maxCap);
     setContextMenu(null);
   };
 
@@ -733,19 +768,69 @@ export default function MapView({
             boxShadow: "0 4px 16px rgba(0,0,0,0.18)",
             padding: "4px 0",
             zIndex: 9999,
-            minWidth: "180px",
+            minWidth: "200px",
           }}
           onClick={(e) => e.stopPropagation()}
         >
-          <div style={ctxMenuItemStyle} onClick={handleContextMenuAction}>
-            {contextMenu.type === "facility"
-              ? (contextMenu.isEdited ? "↩ Restore Facility" : "✕ Remove Facility")
-              : (contextMenu.isEdited ? "↩ Cancel Addition"  : "+ Add Facility Here")}
-          </div>
-          <div style={{ borderTop: "1px solid #f3f4f6", margin: "4px 0" }} />
-          <div style={{ ...ctxMenuItemStyle, color: "#9ca3af" }} onClick={() => setContextMenu(null)}>
-            Cancel
-          </div>
+          {contextMenu.showCapacityForm ? (
+            /* Capacity form — shown after clicking "Add Facility Here" */
+            <div style={{ padding: "8px 12px" }}>
+              <div style={{ fontSize: "0.78rem", fontWeight: 700, color: "#374151", marginBottom: "8px" }}>
+                Set Facility Capacity
+              </div>
+              <div style={{ display: "flex", gap: "6px", marginBottom: "6px" }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: "0.7rem", color: "#6b7280", marginBottom: "2px" }}>Min</div>
+                  <input
+                    type="number"
+                    min={0}
+                    placeholder="None"
+                    value={contextMenu.tempMinCap}
+                    onChange={(e) => setContextMenu((prev) => ({ ...prev, tempMinCap: e.target.value }))}
+                    style={{ width: "100%", padding: "3px 5px", fontSize: "0.78rem", border: "1px solid #d1d5db", borderRadius: "4px", boxSizing: "border-box" }}
+                  />
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: "0.7rem", color: "#6b7280", marginBottom: "2px" }}>Max</div>
+                  <input
+                    type="number"
+                    min={0}
+                    placeholder="∞"
+                    value={contextMenu.tempMaxCap}
+                    onChange={(e) => setContextMenu((prev) => ({ ...prev, tempMaxCap: e.target.value }))}
+                    style={{ width: "100%", padding: "3px 5px", fontSize: "0.78rem", border: "1px solid #d1d5db", borderRadius: "4px", boxSizing: "border-box" }}
+                  />
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: "6px" }}>
+                <button
+                  onClick={handleConfirmCapacity}
+                  style={{ flex: 1, padding: "4px", fontSize: "0.78rem", background: "#2563eb", color: "#fff", border: "none", borderRadius: "4px", cursor: "pointer" }}
+                >
+                  Confirm
+                </button>
+                <button
+                  onClick={(e) => { e.stopPropagation(); setContextMenu(null); }}
+                  style={{ flex: 1, padding: "4px", fontSize: "0.78rem", background: "#f3f4f6", color: "#374151", border: "1px solid #d1d5db", borderRadius: "4px", cursor: "pointer" }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            /* Normal context menu */
+            <>
+              <div style={ctxMenuItemStyle} onClick={handleContextMenuAction}>
+                {contextMenu.type === "facility"
+                  ? (contextMenu.isEdited ? "↩ Restore Facility" : "✕ Remove Facility")
+                  : (contextMenu.isEdited ? "↩ Cancel Addition"  : "+ Add Facility Here")}
+              </div>
+              <div style={{ borderTop: "1px solid #f3f4f6", margin: "4px 0" }} />
+              <div style={{ ...ctxMenuItemStyle, color: "#9ca3af" }} onClick={() => setContextMenu(null)}>
+                Cancel
+              </div>
+            </>
+          )}
         </div>
       )}
     </div>

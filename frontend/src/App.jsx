@@ -61,7 +61,8 @@ function AppInner({ currentUser, onLogout }) {
   const [rebalancingTransfers, setRebalancingTransfers] = useState(null);
 
   // ── Reoptimization state ──
-  const [userEdits, setUserEdits]               = useState({ removed: new Set(), added: new Set() });
+  // addedCapacities: { [censusAreaId]: { min_capacity: number|null, max_capacity: number|null } }
+  const [userEdits, setUserEdits]               = useState({ removed: new Set(), added: new Set(), addedCapacities: {} });
   const [previousResult, setPreviousResult]     = useState(null); // scenario before reoptimization
   const [reoptimizeStatus, setReoptimizeStatus] = useState("idle"); // idle|running|completed|failed
   const [reoptimizeError,  setReoptimizeError]  = useState(null);
@@ -73,7 +74,7 @@ function AppInner({ currentUser, onLogout }) {
   useEffect(() => {
     if (optimizationResult?.scenario_id !== prevScenarioId.current) {
       prevScenarioId.current = optimizationResult?.scenario_id ?? null;
-      setUserEdits({ removed: new Set(), added: new Set() });
+      setUserEdits({ removed: new Set(), added: new Set(), addedCapacities: {} });
       setPreviousResult(null);
       setReoptimizeStatus("idle");
       setReoptimizeError(null);
@@ -99,18 +100,21 @@ function AppInner({ currentUser, onLogout }) {
 
   // ── Existing facilities query ──
   // scope_filters are stored in stats._meta after each optimization run so
-  // that the infrastructure query can be scoped to the selected territory.
-  const scopeParishIds =
-    optimizationResult?.stats?._meta?.scope_filters?.parish_ids ?? null;
+  // that the infrastructure query is scoped to the same territory.
+  const scopeFilters = optimizationResult?.stats?._meta?.scope_filters ?? null;
 
   const { data: existingFacilities = [] } = useQuery({
-    queryKey: ["existing-facilities", facilityType, scopeParishIds],
-    queryFn: () =>
-      infrastructureApi.list({
-        facility_type: facilityType,
-        status: "existing",
-        ...(scopeParishIds ? { parish_ids: scopeParishIds } : {}),
-      }),
+    queryKey: ["existing-facilities", facilityType, scopeFilters],
+    queryFn: () => {
+      const params = { facility_type: facilityType, status: "existing" };
+      if (scopeFilters?.parish_ids?.length)        params.parish_ids      = scopeFilters.parish_ids;
+      else if (scopeFilters?.province_codes?.length) params.province_codes = scopeFilters.province_codes;
+      if (!scopeFilters?.parish_ids?.length) {
+        if (scopeFilters?.canton_codes?.length)    params.canton_codes    = scopeFilters.canton_codes;
+        if (scopeFilters?.parish_codes?.length)    params.parish_codes    = scopeFilters.parish_codes;
+      }
+      return infrastructureApi.list(params);
+    },
     enabled: !!facilityType,
   });
 
@@ -135,12 +139,18 @@ function AppInner({ currentUser, onLogout }) {
     });
   };
 
-  const handleAreaContextMenu = (censusAreaId) => {
+  const handleAreaContextMenu = (censusAreaId, minCapacity = null, maxCapacity = null) => {
     setUserEdits((prev) => {
       const newAdded = new Set(prev.added);
-      if (newAdded.has(censusAreaId)) newAdded.delete(censusAreaId);
-      else newAdded.add(censusAreaId);
-      return { ...prev, added: newAdded };
+      const newCaps  = { ...prev.addedCapacities };
+      if (newAdded.has(censusAreaId)) {
+        newAdded.delete(censusAreaId);
+        delete newCaps[censusAreaId];
+      } else {
+        newAdded.add(censusAreaId);
+        newCaps[censusAreaId] = { min_capacity: minCapacity, max_capacity: maxCapacity };
+      }
+      return { ...prev, added: newAdded, addedCapacities: newCaps };
     });
   };
 
@@ -158,7 +168,7 @@ function AppInner({ currentUser, onLogout }) {
           setFacilityType(ft);
           setPlanningMode(mode);
           setOptimizationResult({ ...data, _facilityType: ft, _mode: mode, _payload: preservedPayload });
-          setUserEdits({ removed: new Set(), added: new Set() });
+          setUserEdits({ removed: new Set(), added: new Set(), addedCapacities: {} });
           setReoptimizeStatus("completed");
           qc.invalidateQueries({ queryKey: ["scenarios"] });
         } else if (data.status === "failed") {
@@ -218,6 +228,16 @@ function AppInner({ currentUser, onLogout }) {
       const fixedIds = Array.from(new Set([...keptIds, ...Array.from(userEdits.added)]));
       const baseP = optimizationResult.p_facilities ?? fixedIds.length;
       const newP = Math.min(200, Math.max(baseP, fixedIds.length));
+
+      // Build per-facility capacity overrides for newly added facilities.
+      const capOverrides = {};
+      for (const [cidStr, caps] of Object.entries(userEdits.addedCapacities)) {
+        if (caps.min_capacity !== null || caps.max_capacity !== null) {
+          capOverrides[cidStr] = caps;
+        }
+      }
+      const hasCapOverrides = Object.keys(capOverrides).length > 0;
+
       payload = {
         ...optimizationResult._payload,
         name: reoptName,
@@ -227,6 +247,7 @@ function AppInner({ currentUser, onLogout }) {
         // User-created facilities (new this round + carried over from prior rounds)
         // need different assignment rules (radius for max_coverage; no cap_min floor).
         reopt_new_facility_ids: newFacilityIds.length > 0 ? newFacilityIds : undefined,
+        per_facility_capacity_overrides: hasCapOverrides ? capOverrides : undefined,
       };
     }
 
@@ -243,6 +264,11 @@ function AppInner({ currentUser, onLogout }) {
       setReoptimizeError(err?.response?.data?.detail || "Failed to start reoptimization.");
     }
   };
+
+  // Default capacity values from the last optimization run (used as defaults for the
+  // per-facility capacity form when the user adds a facility via right-click).
+  const defaultMinCapacity = optimizationResult?._payload?.min_capacity ?? null;
+  const defaultMaxCapacity = optimizationResult?._payload?.max_capacity ?? null;
 
   const hasEdits = userEdits.removed.size > 0 || userEdits.added.size > 0;
   const canReoptimize = !!optimizationResult?._payload;
@@ -313,6 +339,8 @@ function AppInner({ currentUser, onLogout }) {
           onFacilityContextMenu={canReoptimize ? handleFacilityContextMenu : null}
           onAreaContextMenu={canReoptimize ? handleAreaContextMenu : null}
           rebalancingTransfers={rebalancingTransfers}
+          defaultMinCapacity={defaultMinCapacity}
+          defaultMaxCapacity={defaultMaxCapacity}
         />
 
         {/* Stats overlay — top left */}

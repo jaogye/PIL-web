@@ -77,7 +77,7 @@ async def export_scenario_excel(
             .where(OptimizationResult.scenario_id == scenario_id)
         )
         rows = res.all()
-
+        
         # Pre-load census areas for the served-areas sheet.
         all_area_ids: set[int] = set()
         for opt_res, _ in rows:
@@ -89,6 +89,16 @@ async def export_scenario_excel(
                 select(CensusArea).where(CensusArea.id.in_(list(all_area_ids)))
             )
             area_map = {a.id: a for a in area_res.scalars().all()}
+        
+        # Pre-load census areas for unassigned areas sheet.
+        unassigned_raw = (scenario.result_stats or {}).get("_unassigned_areas", [])
+        uncov_area_ids = [ua["census_area_id"] for ua in unassigned_raw if ua.get("census_area_id")]
+        uncov_area_map: dict[int, CensusArea] = {}
+        if uncov_area_ids:
+            uncov_res = await session.execute(
+                select(CensusArea).where(CensusArea.id.in_(uncov_area_ids))
+            )
+            uncov_area_map = {a.id: a for a in uncov_res.scalars().all()}
     finally:
         if owned:
             await session.close()
@@ -151,7 +161,7 @@ async def export_scenario_excel(
     for col in ws_fac.columns:
         max_len = max(len(str(cell.value or "")) for cell in col) + 2
         ws_fac.column_dimensions[col[0].column_letter].width = min(max_len, 30)
-
+    
     # --- Sheet 3: Served Areas ---
     ws_served = wb.create_sheet("Served Areas")
     served_headers = [
@@ -164,7 +174,7 @@ async def export_scenario_excel(
         cell.font = header_font
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center")
-
+    
     for fac_num, (opt_res, fac_area) in enumerate(rows, start=1):
         for entry in (opt_res.served_area_ids or []):
             if isinstance(entry, (list, tuple)):
@@ -191,6 +201,41 @@ async def export_scenario_excel(
     for col in ws_served.columns:
         max_len = max(len(str(cell.value or "")) for cell in col) + 2
         ws_served.column_dimensions[col[0].column_letter].width = min(max_len, 30)
+
+    # --- Sheet 4: Uncovered Areas ---
+    ws_uncov = wb.create_sheet("Uncovered Areas")
+    uncov_headers = [
+        "Area Code", "Area Name", "Province", "Canton", "Parish",
+        "X (Lon)", "Y (Lat)", "Demand",
+        "Nearest Facility", "Travel Time (min)", "Distance (km)",
+    ]
+    ws_uncov.append(uncov_headers)
+    uncov_header_fill = PatternFill(fill_type="solid", fgColor="8B1A1A")
+    for cell in ws_uncov[1]:
+        cell.font = header_font
+        cell.fill = uncov_header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    for ua in unassigned_raw:
+        aid = ua.get("census_area_id")
+        ca  = uncov_area_map.get(aid) if aid else None
+        ws_uncov.append([
+            ua.get("area_code") or (ca.area_code if ca else ""),
+            ua.get("name") or (ca.name if ca else ""),
+            ca.province_code if ca else "",
+            ca.canton_code  if ca else "",
+            ca.parish_code  if ca else "",
+            ua.get("x") or (ca.x if ca else None),
+            ua.get("y") or (ca.y if ca else None),
+            round(ua.get("demand") or 0.0, 2),
+            ua.get("nearest_facility_code") or "",
+            round(ua.get("nearest_facility_travel_time_min") or 0.0, 2),
+            round(ua.get("nearest_facility_distance_km") or 0.0, 2),
+        ])
+
+    for col in ws_uncov.columns:
+        max_len = max(len(str(cell.value or "")) for cell in col) + 2
+        ws_uncov.column_dimensions[col[0].column_letter].width = min(max_len, 30)
 
     buf = io.BytesIO()
     wb.save(buf)

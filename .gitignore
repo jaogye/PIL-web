@@ -76,7 +76,8 @@ backend/scripts/belgium/*.cpg
 backend/scripts/belgium/*.txt
 backend/scripts/**/_extract/
 backend/scripts/**/sectors*/
-backend/scripts/**/pois*/
+backend/scripts/update_*.*
+
 
 # ── Temporary analysis / debug files ───────────────────────────────────────
 *.png
