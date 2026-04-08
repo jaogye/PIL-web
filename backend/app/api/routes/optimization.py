@@ -18,7 +18,7 @@ import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, status
 
 logger = logging.getLogger(__name__)
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session_factory
@@ -124,6 +124,20 @@ async def run_optimization(
     scenario_id = scenario.id
     scenario_name = scenario.name
     await db.commit()
+
+    # Keep only the 8 most recent scenarios; delete older ones (cascade removes their results).
+    _MAX_SCENARIOS = 8
+    old_result = await db.execute(
+        select(OptimizationScenario.id)
+        .order_by(OptimizationScenario.created_at.desc())
+        .offset(_MAX_SCENARIOS)
+    )
+    old_ids = [row[0] for row in old_result.all()]
+    if old_ids:
+        await db.execute(
+            delete(OptimizationScenario).where(OptimizationScenario.id.in_(old_ids))
+        )
+        await db.commit()
 
     asyncio.create_task(_run_optimization_bg(scenario_id, payload, db_name))
 
@@ -510,7 +524,7 @@ async def _run_bump_hunter(
                         area_code=sa.area_code,
                         x=sa.x,
                         y=sa.y,
-                        assigned_demand=round(amount, 4),
+                        assigned_demand=round(amount),
                         travel_time=round(dist, 1) if dist < MAX_DIST else None,
                     )
                 )
@@ -524,7 +538,7 @@ async def _run_bump_hunter(
             name=area.name,
             x=area.x,
             y=area.y,
-            covered_demand=round(covered_dem, 2),
+            covered_demand=round(covered_dem),
             assigned_areas=len(served_pairs),
             max_travel_time=max_tt,
             is_existing=_is_existing,
@@ -542,7 +556,7 @@ async def _run_bump_hunter(
     bh_base_stats = bh.stats if bh is not None else {
         "num_bumps": len(all_bump_indices),
         "total_areas": len(areas),
-        "total_demand": float(np.sum(demand)),
+        "total_demand": round(float(np.sum(demand))),
     }
     stats = {
         **bh_base_stats,
@@ -634,12 +648,23 @@ async def _resolve_pre_selected(
                 )
             )
             existing_facs = fac_result.scalars().all()
+            seen_idx: set[int] = set()
             for f in existing_facs:
                 if f.census_area_id in area_id_to_idx:
                     idx = area_id_to_idx[f.census_area_id]
-                    pre_selected.append(idx)
-                    # capacity=0 means no assignment; None (shouldn't happen, NOT NULL) → no limit
-                    existing_capacity[idx] = float(f.capacity) if f.capacity is not None else math.inf
+                    cap = float(f.capacity) if f.capacity is not None else math.inf
+                    if idx not in seen_idx:
+                        pre_selected.append(idx)
+                        seen_idx.add(idx)
+                        # capacity=0 means no assignment; None (shouldn't happen, NOT NULL) → no limit
+                        existing_capacity[idx] = cap
+                    else:
+                        # Multiple DB facilities at the same census area: sum capacities.
+                        prev = existing_capacity[idx]
+                        existing_capacity[idx] = (
+                            math.inf if prev == math.inf or cap == math.inf
+                            else prev + cap
+                        )
             pre_selected_set = set(pre_selected)
 
     return (
@@ -699,18 +724,25 @@ def _compute_unassigned_areas(
                 if nearest_tt > 0:
                     nearest_speed = round(d_km / (nearest_tt / 60.0), 1)
 
+        # Within service radius but no capacity available → capacity-constrained exclusion.
+        capacity_unassigned = (
+            assignment_radius is not None
+            and nearest_tt <= assignment_radius
+        )
+
         unassigned_areas_out.append({
             "census_area_id": a.id,
             "area_code":      a.area_code,
             "name":           a.name,
             "x":              a.x,
             "y":              a.y,
-            "demand":         round(float(demand[idx]), 2),
+            "demand":         round(float(demand[idx])),
             "nearest_facility_code":             nearest_code,
             "nearest_facility_travel_time_min":  tt_out,
             "nearest_facility_distance_km":      nearest_dist_km,
             "travel_speed_kmh":                  nearest_speed,
             "avg_speed_kmh":                     a.avg_speed_kmh,
+            "capacity_unassigned":               capacity_unassigned,
         })
     return unassigned_areas_out
 
@@ -847,9 +879,9 @@ async def _run_optimization_bg(
                     for asgns in assignments.values()
                 )
                 stats: dict = {
-                    "total_demand": round(total_dem, 2),
-                    "covered_demand": round(assigned_dem, 2),
-                    "uncovered_demand": round(total_dem - assigned_dem, 2),
+                    "total_demand": round(total_dem),
+                    "covered_demand": round(assigned_dem),
+                    "uncovered_demand": round(total_dem - assigned_dem),
                     "coverage_pct": (
                         round(assigned_dem / total_dem * 100, 2) if total_dem > 0 else 0.0
                     ),
@@ -911,7 +943,15 @@ async def _run_optimization_bg(
                 # Update num_facilities to reflect the count after min_capacity filtering.
                 stats["num_facilities"] = len(final_facility_indices)
 
-            # 9. Invert assignments.
+            # 9. Deduplicate and invert assignments.
+            # Guard against duplicate indices that would produce multiple DB rows
+            # for the same (scenario_id, census_area_id) pair.
+            seen: set[int] = set()
+            final_facility_indices = [
+                idx for idx in final_facility_indices
+                if not (idx in seen or seen.add(idx))
+            ]
+            stats["num_facilities"] = len(final_facility_indices)
             final_set = set(final_facility_indices)
             facility_to_served: dict[int, list[tuple[int, float]]] = defaultdict(list)
             for area_idx, fac_assignments in assignments.items():
@@ -934,7 +974,7 @@ async def _run_optimization_bg(
                 valid_tt = [tt for _, _, tt in served_with_tt if tt < MAX_DIST]
                 max_tt = float(max(valid_tt)) if valid_tt else None
 
-                served_ids = [[areas[area_i].id, round(amt, 4)] for area_i, amt, _ in served_with_tt]
+                served_ids = [[areas[area_i].id, round(amt)] for area_i, amt, _ in served_with_tt]
 
                 orm_result = OptimizationResult(
                     scenario_id=scenario_id,
@@ -967,21 +1007,14 @@ async def _run_optimization_bg(
             )
             stats["max_travel_time_minutes"] = round(_actual_max_tt, 2)
 
-            # For max_coverage the solver already computes covered_demand,
-            # uncovered_demand and coverage_pct correctly (based on areas within
-            # service radius).  Overwriting them with _total_assigned produces
-            # inflated values in complete_existing mode because the route's
-            # capacity assignment uses DB capacities that differ from the solver's
-            # internal Phase-0 capacities.
-            # For p_median / p_center those keys don't exist in the solver stats
-            # yet, so we add them here from the capacity-constrained assignment.
-            if payload.model_type != ModelType.MAX_COVERAGE:
-                stats["covered_demand"]   = round(min(_total_assigned, _total_dem), 2)
-                stats["uncovered_demand"] = round(max(_total_dem - _total_assigned, 0.0), 2)
-                stats["coverage_pct"] = (
-                    round(min(_total_assigned, _total_dem) / _total_dem * 100, 2)
-                    if _total_dem > 0 else 0.0
-                )
+            # Always use the capacity-constrained assigned demand for covered_demand
+            # so that Summary stats match the Served Areas sheet totals.
+            stats["covered_demand"]   = round(min(_total_assigned, _total_dem))
+            stats["uncovered_demand"] = round(max(_total_dem - _total_assigned, 0.0))
+            stats["coverage_pct"] = (
+                round(min(_total_assigned, _total_dem) / _total_dem * 100, 2)
+                if _total_dem > 0 else 0.0
+            )
 
             # 11. Build full location objects (with served_areas for map).
             locations = []
@@ -996,7 +1029,7 @@ async def _run_optimization_bg(
                                 area_code=sa.area_code,
                                 x=sa.x,
                                 y=sa.y,
-                                assigned_demand=round(amt, 4),
+                                assigned_demand=round(amt),
                                 travel_time=round(tt, 1) if tt < MAX_DIST else None,
                                 avg_speed_kmh=sa.avg_speed_kmh,
                             )
@@ -1023,7 +1056,7 @@ async def _run_optimization_bg(
                         name=area.name,
                         x=area.x,
                         y=area.y,
-                        covered_demand=float(sum(amt for _, amt, _ in served_with_tt)),
+                        covered_demand=round(sum(amt for _, amt, _ in served_with_tt)),
                         assigned_areas=len(served_with_tt),
                         max_travel_time=max_tt,
                         avg_speed_kmh=area.avg_speed_kmh,

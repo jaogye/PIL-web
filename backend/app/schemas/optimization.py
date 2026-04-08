@@ -142,6 +142,8 @@ class UnassignedAreaInfo(BaseModel):
     nearest_facility_distance_km: float | None = None
     travel_speed_kmh: float | None = None  # speed computed on-the-fly to nearest facility
     avg_speed_kmh: float | None = None      # stored vpd for this census area
+    # True when the area is within the service radius but received no capacity assignment.
+    capacity_unassigned: bool = False
 
 
 class OptimizationResponse(BaseModel):

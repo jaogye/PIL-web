@@ -155,7 +155,7 @@ async def export_scenario_excel(
             area.parish_code,
             area.x,
             area.y,
-            round(opt_res.covered_demand or 0.0, 2),
+            round(opt_res.covered_demand or 0.0),
         ])
 
     for col in ws_fac.columns:
@@ -195,7 +195,7 @@ async def export_scenario_excel(
                 sa.parish_code,
                 sa.x,
                 sa.y,
-                round(demand_amt, 2),
+                round(demand_amt),
             ])
 
     for col in ws_served.columns:
@@ -207,7 +207,7 @@ async def export_scenario_excel(
     uncov_headers = [
         "Area Code", "Area Name", "Province", "Canton", "Parish",
         "X (Lon)", "Y (Lat)", "Demand",
-        "Nearest Facility", "Travel Time (min)", "Distance (km)",
+        "Nearest Facility", "Travel Time (min)", "Distance (km)", "Reason",
     ]
     ws_uncov.append(uncov_headers)
     uncov_header_fill = PatternFill(fill_type="solid", fgColor="8B1A1A")
@@ -216,9 +216,13 @@ async def export_scenario_excel(
         cell.fill = uncov_header_fill
         cell.alignment = Alignment(horizontal="center")
 
+    # Red fill for areas within the service radius that received no capacity.
+    capacity_row_fill = PatternFill(fill_type="solid", fgColor="FFCCCC")
+
     for ua in unassigned_raw:
         aid = ua.get("census_area_id")
         ca  = uncov_area_map.get(aid) if aid else None
+        is_capacity_unassigned = bool(ua.get("capacity_unassigned", False))
         ws_uncov.append([
             ua.get("area_code") or (ca.area_code if ca else ""),
             ua.get("name") or (ca.name if ca else ""),
@@ -227,11 +231,15 @@ async def export_scenario_excel(
             ca.parish_code  if ca else "",
             ua.get("x") or (ca.x if ca else None),
             ua.get("y") or (ca.y if ca else None),
-            round(ua.get("demand") or 0.0, 2),
+            round(ua.get("demand") or 0.0),
             ua.get("nearest_facility_code") or "",
             round(ua.get("nearest_facility_travel_time_min") or 0.0, 2),
             round(ua.get("nearest_facility_distance_km") or 0.0, 2),
+            "No capacity" if is_capacity_unassigned else "Outside radius",
         ])
+        if is_capacity_unassigned:
+            for cell in ws_uncov[ws_uncov.max_row]:
+                cell.fill = capacity_row_fill
 
     for col in ws_uncov.columns:
         max_len = max(len(str(cell.value or "")) for cell in col) + 2

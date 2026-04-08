@@ -519,8 +519,8 @@ export default function MapView({
         );
       });
 
-      // 3. Unassigned areas — pink squares (areas not served by any facility).
-      unassignedAreas.forEach(({ census_area_id, area_code, name, x, y, demand, nearest_facility_code, nearest_facility_travel_time_min, nearest_facility_distance_km, travel_speed_kmh, avg_speed_kmh }) => {
+      // 3. Unassigned areas — pink squares (outside radius) or red squares (within radius, no capacity).
+      unassignedAreas.forEach(({ census_area_id, area_code, name, x, y, demand, nearest_facility_code, nearest_facility_travel_time_min, nearest_facility_distance_km, travel_speed_kmh, avg_speed_kmh, capacity_unassigned }) => {
         if (!x || !y) return;
         const isAdded = added.has(census_area_id);
         const el = document.createElement("div");
@@ -534,6 +534,12 @@ export default function MapView({
             font-size: 10px; color: #fff; font-weight: 700;
           `;
           el.textContent = "+";
+        } else if (capacity_unassigned) {
+          // Within service radius but all nearby facilities were full.
+          el.style.cssText = `
+            width: 10px; height: 10px;
+            background: #dc2626; border: 1.5px solid #7f1d1d; cursor: pointer;
+          `;
         } else {
           el.style.cssText = `
             width: 10px; height: 10px;
@@ -542,11 +548,14 @@ export default function MapView({
         }
 
         const displayName = name || area_code || "—";
+        const reasonLabel = capacity_unassigned
+          ? `<em style="color:#dc2626;font-size:0.75em">Within radius — no capacity available</em>`
+          : `<em style="color:#6b7280;font-size:0.75em">Not covered — right-click to add facility here</em>`;
         const popupHtml = isAdded
           ? `<strong>Proposed Facility</strong><br/>
              ${displayName}<br/>
              <em style="color:#6b7280;font-size:0.75em">Right-click to cancel addition</em>`
-          : `<strong>Unassigned Area</strong><br/>
+          : `<strong>${capacity_unassigned ? "Capacity-Unassigned Area" : "Unassigned Area"}</strong><br/>
              ${displayName}<br/>
              ${demand != null ? `Demand: <strong>${demand.toLocaleString()}</strong><br/>` : ""}
              ${nearest_facility_code ? `Nearest facility: <strong>${nearest_facility_code}</strong><br/>` : ""}
@@ -554,7 +563,7 @@ export default function MapView({
              ${nearest_facility_distance_km != null ? `Distance: <strong>${nearest_facility_distance_km.toFixed(1)} km</strong><br/>` : ""}
              ${travel_speed_kmh != null ? `Speed: <strong>${travel_speed_kmh} km/h</strong><br/>` : ""}
              ${avg_speed_kmh != null ? `Avg. area speed (vpd): <strong>${Number(avg_speed_kmh).toFixed(1)} km/h</strong><br/>` : ""}
-             <em style="color:#6b7280;font-size:0.75em">Not covered — right-click to add facility here</em>`;
+             ${reasonLabel}`;
 
         const popup = new maplibregl.Popup({ offset: 8 }).setHTML(popupHtml);
         el.addEventListener("contextmenu", (e) => openAreaMenu(e, census_area_id));

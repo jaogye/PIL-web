@@ -925,9 +925,9 @@ def _compute_stats(
     loads = [fac_load.get(f, 0.0) for f in facilities]
 
     return {
-        "total_demand": round(total_demand, 2),
-        "covered_demand": round(covered_demand, 2),
-        "uncovered_demand": round(total_demand - covered_demand, 2),
+        "total_demand": round(total_demand),
+        "covered_demand": round(covered_demand),
+        "uncovered_demand": round(total_demand - covered_demand),
         "coverage_pct": (
             round(covered_demand / total_demand * 100, 2) if total_demand > 0 else 0.0
         ),
@@ -937,7 +937,7 @@ def _compute_stats(
         "num_uncovered_areas": int(np.sum(~covered)),
         "cap_min": cap_min,
         "cap_max": cap_max if cap_max != math.inf else None,
-        "avg_facility_load": round(float(np.mean(loads)), 2) if loads else 0.0,
-        "min_facility_load": round(min(loads), 2) if loads else 0.0,
-        "max_facility_load": round(max(loads), 2) if loads else 0.0,
+        "avg_facility_load": round(float(np.mean(loads))) if loads else 0,
+        "min_facility_load": round(min(loads)) if loads else 0,
+        "max_facility_load": round(max(loads)) if loads else 0,
     }
