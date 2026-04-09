@@ -6,6 +6,7 @@ from .p_center import solve as p_center_solve, PCenterResult
 from .max_coverage import solve as max_coverage_solve, MaxCoverageResult
 from .rebalancing import solve as rebalancing_solve, RebalancingResult
 from .bump_hunter import solve as bump_hunter_solve, BumpHunterResult
+from .assignment import single_capacity_pass, capacity_assignment
 
 __all__ = [
     "SparseDistanceMatrix",
@@ -14,6 +15,8 @@ __all__ = [
     "max_coverage_solve",
     "rebalancing_solve",
     "bump_hunter_solve",
+    "single_capacity_pass",
+    "capacity_assignment",
     "PMedianResult",
     "PCenterResult",
     "MaxCoverageResult",

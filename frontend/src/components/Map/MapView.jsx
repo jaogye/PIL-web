@@ -8,7 +8,7 @@
  * markers for the reoptimization feature.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import maplibregl from "maplibre-gl";
 
 const DB_VIEWS = {
@@ -157,7 +157,7 @@ const LAYER_GROUPS = [
 
 const ALL_VISIBLE = Object.fromEntries(LAYER_GROUPS.map((g) => [g.id, true]));
 
-export default function MapView({
+const MapView = forwardRef(function MapView({
   facilities = [],
   existingFacilities = [],
   unassignedAreas = [],
@@ -170,12 +170,25 @@ export default function MapView({
   rebalancingTransfers = null,
   defaultMinCapacity = null,
   defaultMaxCapacity = null,
-}) {
-  const mapContainer      = useRef(null);
-  const mapRef            = useRef(null);
-  const markersRef        = useRef([]);
-  const linesReadyRef     = useRef(false);
-  const prevFacilitiesRef = useRef(null);
+}, ref) {
+  const mapContainer           = useRef(null);
+  const mapRef                 = useRef(null);
+  const markersRef             = useRef([]);
+  const linesReadyRef          = useRef(false);
+  const prevFacilitiesRef      = useRef(null);
+  const rebalTransfersRef      = useRef(rebalancingTransfers);
+
+  // Expose flyToCoords so parent components can programmatically pan the map.
+  useImperativeHandle(ref, () => ({
+    flyToCoords(x, y) {
+      const map = mapRef.current;
+      if (!map || x == null || y == null) return;
+      map.flyTo({ center: [x, y], zoom: Math.max(map.getZoom(), 12), speed: 1.2 });
+    },
+  }));
+
+  // Keep rebalTransfersRef in sync so the map "load" callback can access latest value.
+  useEffect(() => { rebalTransfersRef.current = rebalancingTransfers; }, [rebalancingTransfers]);
 
   // Use refs so event listeners always call the latest version without re-creating markers.
   const onFacilityContextMenuRef = useRef(onFacilityContextMenu);
@@ -277,6 +290,19 @@ export default function MapView({
       map.on("mouseleave", REBAL_LAYER, () => { map.getCanvas().style.cursor = ""; });
 
       linesReadyRef.current = true;
+
+      // Render any transfers that arrived before the map was ready.
+      const pendingTransfers = rebalTransfersRef.current;
+      if (pendingTransfers?.length) {
+        const features = pendingTransfers
+          .filter((t) => t.from_x != null && t.from_y != null && t.to_x != null && t.to_y != null)
+          .map((t) => ({
+            type: "Feature",
+            properties: { from_code: t.from_area_code, to_code: t.to_area_code, amount: t.amount, impact: t.impact },
+            geometry: { type: "LineString", coordinates: [[t.from_x, t.from_y], [t.to_x, t.to_y]] },
+          }));
+        map.getSource(REBAL_SOURCE)?.setData({ type: "FeatureCollection", features });
+      }
     });
 
     mapRef.current = map;
@@ -314,38 +340,33 @@ export default function MapView({
   // ── Update rebalancing transfer lines ─────────────────────────────
   useEffect(() => {
     const map = mapRef.current;
-    if (!map) return;
+    if (!map || !linesReadyRef.current) return;  // sources not yet added
 
-    const update = () => {
-      const source = map.getSource(REBAL_SOURCE);
-      if (!source) return;
+    const source = map.getSource(REBAL_SOURCE);
+    if (!source) return;
 
-      if (!rebalancingTransfers || rebalancingTransfers.length === 0) {
-        source.setData({ type: "FeatureCollection", features: [] });
-        return;
-      }
+    if (!rebalancingTransfers || rebalancingTransfers.length === 0) {
+      source.setData({ type: "FeatureCollection", features: [] });
+      return;
+    }
 
-      const features = rebalancingTransfers
-        .filter((t) => t.from_x && t.from_y && t.to_x && t.to_y)
-        .map((t) => ({
-          type: "Feature",
-          properties: {
-            from_code: t.from_area_code,
-            to_code:   t.to_area_code,
-            amount:    t.amount,
-            impact:    t.impact,
-          },
-          geometry: {
-            type: "LineString",
-            coordinates: [[t.from_x, t.from_y], [t.to_x, t.to_y]],
-          },
-        }));
+    const features = rebalancingTransfers
+      .filter((t) => t.from_x != null && t.from_y != null && t.to_x != null && t.to_y != null)
+      .map((t) => ({
+        type: "Feature",
+        properties: {
+          from_code: t.from_area_code,
+          to_code:   t.to_area_code,
+          amount:    t.amount,
+          impact:    t.impact,
+        },
+        geometry: {
+          type: "LineString",
+          coordinates: [[t.from_x, t.from_y], [t.to_x, t.to_y]],
+        },
+      }));
 
-      source.setData({ type: "FeatureCollection", features });
-    };
-
-    if (map.isStyleLoaded()) update();
-    else map.once("load", update);
+    source.setData({ type: "FeatureCollection", features });
   }, [rebalancingTransfers]);
 
   // ── Fly to country when database changes ──────────────────────────
@@ -657,10 +678,12 @@ export default function MapView({
 
         const popupHtml = isRemoved
           ? `<strong>Facility ${idx + 1} — Marked for removal</strong><br/>
-             ${facility.name || facility.area_code}<br/>
+             ${facility.name || "—"}<br/>
+             <span style="font-size:0.8em;color:#6b7280">${facility.area_code}</span><br/>
              <em style="color:#6b7280;font-size:0.75em">Right-click to restore</em>`
           : `<strong>Facility ${idx + 1}${isUserAdded ? " (user added)" : isExisting ? " (existing)" : ""}</strong><br/>
-             ${facility.name || facility.area_code}<br/>
+             ${facility.name || "—"}<br/>
+             <span style="font-size:0.8em;color:#6b7280">${facility.area_code}</span><br/>
              Demand served: <strong>${(facility.covered_demand || 0).toLocaleString()}</strong><br/>
              ${dbCapStr != null ? `Current capacity: <strong>${dbCapStr}</strong><br/>` : ""}
              Max access: <strong>${maxTime}</strong><br/>
@@ -844,7 +867,9 @@ export default function MapView({
       )}
     </div>
   );
-}
+});
+
+export default MapView;
 
 // ── Styles ──────────────────────────────────────────────────────────────────
 

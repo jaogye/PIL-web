@@ -191,9 +191,29 @@ All algorithms operate on a **sparse travel-time matrix** between census areas a
 
 ### Capacity Rebalancing
 
-**Objective:** reduce unmet demand by transferring surplus capacity from over-served facilities to under-served ones.
-**Algorithm:** Greedy transfer heuristic — at each step, transfers capacity from the facility with the highest surplus to the facility with the highest deficit, respecting a minimum operational floor.
-**Use case:** Improve an existing network without relocating or building facilities.
+**Objective:** reduce unmet demand by transferring surplus capacity from over-served facilities to under-served ones, without changing facility locations.
+
+**Algorithm:** Greedy transfer heuristic. Each census area is assigned to its nearest facility (no radius restriction). Then, iteratively:
+1. Find the facility with the highest unmet demand (deficit = assigned demand − capacity).
+2. Find the facility with the highest available surplus (surplus = capacity − assigned demand, above the operational floor).
+3. Transfer `min(surplus, deficit)` capacity units from donor to recipient.
+4. Repeat until no unmet demand remains or the transfer limit is reached.
+
+**Parameters:**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `capacity_per_facility` | Average covered demand | Uniform capacity target assigned to all facilities before rebalancing starts |
+| `min_capacity` | 0 | Operational floor — the minimum capacity any facility must retain after transfers |
+| `max_transfers` | 20 | Maximum number of transfer operations to propose |
+
+**Output:**
+- List of recommended transfers: *from facility → to facility*, amount transferred, estimated impact on unmet demand.
+- Updated capacity for each facility after all transfers.
+- Unmet demand before and after, and percentage improvement.
+- Transfers are drawn on the map as orange lines with thickness proportional to the transferred amount. Click a line to see the transfer details.
+
+**Use case:** Improve an existing network without relocating or building facilities — redistribute staff, equipment, or budget to where it is most needed.
 
 ---
 

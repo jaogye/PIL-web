@@ -57,6 +57,9 @@ function AppInner({ currentUser, onLogout }) {
   // Sync the axios client header with the user's default accessible database on mount.
   useEffect(() => { setDatabase(defaultDb); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Map ref (exposes flyToCoords) ──
+  const mapViewRef = useRef(null);
+
   // ── Rebalancing state ──
   const [rebalancingTransfers, setRebalancingTransfers] = useState(null);
 
@@ -321,6 +324,7 @@ function AppInner({ currentUser, onLogout }) {
           key={panelKey}
           onResultsReady={handleResultsReady}
           onRebalancingResult={setRebalancingTransfers}
+          onFlyToCoords={(x, y) => mapViewRef.current?.flyToCoords(x, y)}
           selectedDb={selectedDb}
         />
         </div>
@@ -329,6 +333,7 @@ function AppInner({ currentUser, onLogout }) {
       {/* ── Map ── */}
       <main style={{ flex: 1, position: "relative" }}>
         <MapView
+          ref={mapViewRef}
           facilities={optimizationResult?.facility_locations ?? []}
           existingFacilities={visibleExistingFacilities}
           unassignedAreas={optimizationResult?.unassigned_areas ?? []}

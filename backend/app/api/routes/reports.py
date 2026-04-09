@@ -12,6 +12,7 @@ are plain <a href> tags that cannot send the X-LIP2-Database header.
 import io
 import json
 from datetime import datetime
+from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -77,19 +78,48 @@ async def export_scenario_excel(
             .where(OptimizationResult.scenario_id == scenario_id)
         )
         rows = res.all()
-        
-        # Pre-load census areas for the served-areas sheet.
-        all_area_ids: set[int] = set()
-        for opt_res, _ in rows:
-            for entry in (opt_res.served_area_ids or []):
-                all_area_ids.add(int(entry[0]) if isinstance(entry, (list, tuple)) else int(entry))
+
         area_map: dict[int, CensusArea] = {}
-        if all_area_ids:
-            area_res = await session.execute(
-                select(CensusArea).where(CensusArea.id.in_(list(all_area_ids)))
+
+        # Bump hunter stores results in result_stats._locations (no optimization_results rows).
+        # Reconstruct rows and area_map from the cached location data.
+        locations_raw = (scenario.result_stats or {}).get("_locations", [])
+        if not rows and locations_raw:
+            bh_ids: set[int] = set()
+            for loc in locations_raw:
+                bh_ids.add(loc["census_area_id"])
+                for sa in loc.get("served_areas", []):
+                    bh_ids.add(sa["census_area_id"])
+            bh_res = await session.execute(
+                select(CensusArea).where(CensusArea.id.in_(list(bh_ids)))
             )
-            area_map = {a.id: a for a in area_res.scalars().all()}
-        
+            area_map = {a.id: a for a in bh_res.scalars().all()}
+
+            rows = []
+            for loc in locations_raw:
+                ca = area_map.get(loc["census_area_id"])
+                if ca is None:
+                    continue
+                opt = SimpleNamespace(
+                    covered_demand=loc.get("covered_demand", 0),
+                    served_area_ids=[
+                        [sa["census_area_id"], sa.get("assigned_demand", 0)]
+                        for sa in loc.get("served_areas", [])
+                    ],
+                )
+                rows.append((opt, ca))
+        else:
+            # Normal models: pre-load census areas for the served-areas sheet.
+            all_area_ids: set[int] = set()
+            for opt_res, _ in rows:
+                for entry in (opt_res.served_area_ids or []):
+                    all_area_ids.add(int(entry[0]) if isinstance(entry, (list, tuple)) else int(entry))
+            if all_area_ids:
+                area_res = await session.execute(
+                    select(CensusArea).where(CensusArea.id.in_(list(all_area_ids)))
+                )
+                area_map = {a.id: a for a in area_res.scalars().all()}
+
         # Pre-load census areas for unassigned areas sheet.
         unassigned_raw = (scenario.result_stats or {}).get("_unassigned_areas", [])
         uncov_area_ids = [ua["census_area_id"] for ua in unassigned_raw if ua.get("census_area_id")]

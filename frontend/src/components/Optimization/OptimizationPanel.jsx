@@ -100,7 +100,7 @@ const FACILITY_TYPE_OPTIONS = [
 
 // ─── Component ───────────────────────────────────────────────────────────────
 
-export default function OptimizationPanel({ onResultsReady, onRebalancingResult, selectedDb = "lip2_ecuador" }) {
+export default function OptimizationPanel({ onResultsReady, onRebalancingResult, onFlyToCoords, selectedDb = "lip2_ecuador" }) {
   const queryClient = useQueryClient();
 
   const [form, setForm] = useState({
@@ -262,12 +262,14 @@ export default function OptimizationPanel({ onResultsReady, onRebalancingResult,
     delete payload.k_vec;
 
     if (isBumpHunter) {
-      // Bump hunter has no p_facilities.
+      // Bump hunter has no p_facilities or min_capacity.
       delete payload.p_facilities;
       delete payload.min_capacity;
-      delete payload.max_capacity;
       // service_radius is required for bump hunter.
       payload.service_radius = Number(form.service_radius);
+      // max_capacity limits how much demand each planned facility can absorb.
+      if (form.max_capacity !== "") payload.max_capacity = Number(form.max_capacity);
+      else delete payload.max_capacity;
       // Pack bump-hunter-specific params.
       payload.parameters = {
         k_neighbors: form.k_neighbors !== "" ? Number(form.k_neighbors) : 10,
@@ -498,8 +500,8 @@ export default function OptimizationPanel({ onResultsReady, onRebalancingResult,
           </>
         )}
 
-        {/* service radius (max_coverage and bump_hunter) */}
-        {(form.model_type === "max_coverage" || form.model_type === "bump_hunter") && (
+        {/* service radius for max_coverage (alone) */}
+        {form.model_type === "max_coverage" && (
           <>
             <label style={labelStyle}>Service Radius (minutes)</label>
             <input
@@ -511,29 +513,58 @@ export default function OptimizationPanel({ onResultsReady, onRebalancingResult,
           </>
         )}
 
-        {/* bump_hunter parameters */}
+        {/* bump_hunter: service radius + max capacity on the same line */}
         {form.model_type === "bump_hunter" && (
-          <>
-            <label style={labelStyle}>Neighbourhood Size (k)</label>
-            <input
-              style={inputStyle}
-              type="number" min={1} max={500}
-              value={form.k_neighbors}
-              placeholder="10"
-              onChange={(e) => setForm({ ...form, k_neighbors: e.target.value })}
-            />
-            <label style={labelStyle}>Momentum Neighbours (k_vec)</label>
-            <input
-              style={inputStyle}
-              type="number" min={1} max={5000}
-              value={form.k_vec}
-              placeholder="100"
-              onChange={(e) => setForm({ ...form, k_vec: e.target.value })}
-            />
-          </>
+          <div style={{ display: "flex", gap: "0.5rem" }}>
+            <div style={{ flex: 1 }}>
+              <label style={labelStyle}>Service Radius (min)</label>
+              <input
+                style={inputStyle}
+                type="number" min={1} max={600}
+                value={form.service_radius}
+                onChange={(e) => setForm({ ...form, service_radius: e.target.value })}
+              />
+            </div>
+            <div style={{ flex: 1 }}>
+              <label style={labelStyle}>Max Capacity</label>
+              <input
+                style={inputStyle}
+                type="number" min={0}
+                value={form.max_capacity}
+                placeholder="∞"
+                onChange={(e) => setForm({ ...form, max_capacity: e.target.value })}
+              />
+            </div>
+          </div>
         )}
 
-        {/* Capacity controls – hidden for bump_hunter */}
+        {/* bump_hunter: neighbourhood size and momentum neighbours on the same line */}
+        {form.model_type === "bump_hunter" && (
+          <div style={{ display: "flex", gap: "0.5rem" }}>
+            <div style={{ flex: 1 }}>
+              <label style={labelStyle}>Neighbourhood Size (k)</label>
+              <input
+                style={inputStyle}
+                type="number" min={1} max={500}
+                value={form.k_neighbors}
+                placeholder="10"
+                onChange={(e) => setForm({ ...form, k_neighbors: e.target.value })}
+              />
+            </div>
+            <div style={{ flex: 1 }}>
+              <label style={labelStyle}>Momentum Neighbours (k_vec)</label>
+              <input
+                style={inputStyle}
+                type="number" min={1} max={5000}
+                value={form.k_vec}
+                placeholder="100"
+                onChange={(e) => setForm({ ...form, k_vec: e.target.value })}
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Capacity controls (min + max) – hidden for bump_hunter which has its own max capacity above */}
         {form.model_type !== "bump_hunter" && (
           <div style={{ display: "flex", gap: "0.5rem" }}>
             <div style={{ flex: 1 }}>
@@ -676,7 +707,7 @@ export default function OptimizationPanel({ onResultsReady, onRebalancingResult,
       )}
 
       {/* ── Rebalancing section ── */}
-      {activeScenarioData?.scenario_id && activeScenarioData?.model_type !== "bump_hunter" && (
+      {activeScenarioData?.scenario_id && (
         <div style={rebalSectionStyle}>
           <button
             type="button"
@@ -774,15 +805,24 @@ export default function OptimizationPanel({ onResultsReady, onRebalancingResult,
                     <>
                       <div style={{ fontSize: "0.78rem", fontWeight: 600, marginBottom: "0.35rem" }}>
                         {rebalResult.transfers.length} Recommended Transfer{rebalResult.transfers.length !== 1 ? "s" : ""}
-                        <span style={{ fontSize: "0.72rem", color: "#6b7280", fontWeight: 400, marginLeft: "0.5rem" }}>
-                          (shown on map as orange lines)
-                        </span>
                       </div>
                       {rebalResult.transfers.map((t, i) => (
                         <div key={i} style={transferRowStyle}>
-                          <span style={{ fontWeight: 600, color: "#ef4444" }}>{t.from_area_code || "F" + i}</span>
+                          <span
+                            style={{ fontWeight: 600, color: "#ef4444", cursor: "pointer", textDecoration: "underline dotted" }}
+                            title="Click to locate on map"
+                            onClick={() => onFlyToCoords?.(t.from_x, t.from_y)}
+                          >
+                            {t.from_area_code || "F" + i}
+                          </span>
                           <span style={{ color: "#6b7280", fontSize: "0.75rem" }}>→</span>
-                          <span style={{ fontWeight: 600, color: "#16a34a" }}>{t.to_area_code || "T" + i}</span>
+                          <span
+                            style={{ fontWeight: 600, color: "#16a34a", cursor: "pointer", textDecoration: "underline dotted" }}
+                            title="Click to locate on map"
+                            onClick={() => onFlyToCoords?.(t.to_x, t.to_y)}
+                          >
+                            {t.to_area_code || "T" + i}
+                          </span>
                           <span style={{ marginLeft: "auto", fontSize: "0.75rem", color: "#374151" }}>
                             {t.amount.toLocaleString(undefined, { maximumFractionDigits: 0 })} units
                           </span>
