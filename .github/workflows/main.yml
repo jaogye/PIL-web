@@ -3,7 +3,7 @@ name: Deploy to Hetzner
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:   # Permite ejecutar manualmente desde la pestaña Actions
+  workflow_dispatch:   # It allows you to run it manually from the Actions tab
 
 jobs:
   deploy:
@@ -21,7 +21,7 @@ jobs:
           key: ${{ secrets.HETZNER_SSH_KEY }}
           port: 22
           script: |
-            cd /opt/lip2   # ← Cambia esta ruta por la real en tu servidor
+            cd /opt/lip2   # ← Change this route to the actual one on your server.
             git pull origin main
             docker compose down
             docker compose up --build -d
