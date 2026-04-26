@@ -1,13 +1,17 @@
-name: Deploy to Hetzner
+name: Deploy to Hetzner (Secure)
 
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:   # Permite ejecutar manualmente desde la pestaña Actions
+  workflow_dispatch:   # Allows manual trigger from the Actions tab
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    
+    # Minimal permissions (security best practice)
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout code
@@ -17,13 +21,39 @@ jobs:
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.HETZNER_HOST }}
-          username: ${{ secrets.HETZNER_USER }}
-          key: ${{ secrets.HETZNER_SSH_KEY }}
+          username: ${{ secrets.HETZNER_USER }}           # Non-root user recommended (e.g. deploy)
+          key: ${{ secrets.HETZNER_SSH_KEY }}             # Private SSH key
+          passphrase: ${{ secrets.HETZNER_SSH_PASSPHRASE }} # Optional but recommended
           port: 22
+          # Important: verifies the host to prevent MITM attacks
+          fingerprint: ${{ secrets.HETZNER_HOST_FINGERPRINT }}
+          
           script: |
-            cd /opt/lip2   # ← Cambia esta ruta por la real en tu servidor
-            git pull origin main
-            docker compose down
-            docker compose up --build -d
-            echo "✅ Deploy completado correctamente"
+            set -e  # Exit immediately if a command exits with a non-zero status
 
+            echo "🚀 Starting secure deployment..."
+
+            # Change this to your actual project directory on the server
+            cd /opt/lip2
+
+            # Securely update the code
+            echo "📥 Updating code from repository..."
+            git fetch origin
+            git reset --hard origin/main
+            git clean -fd
+
+            # Safety check: ensure docker-compose.yml exists
+            if [ ! -f docker-compose.yml ]; then
+              echo "❌ Error: docker-compose.yml not found"
+              exit 1
+            fi
+
+            echo "🛑 Stopping previous containers..."
+            docker compose down --remove-orphans
+
+            echo "🔨 Rebuilding and starting containers..."
+            docker compose up --build -d --force-recreate
+
+            echo "✅ Deployment completed successfully at $(date)"
+            echo "📊 Current container status:"
+            docker compose ps
