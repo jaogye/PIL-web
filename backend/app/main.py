@@ -37,6 +37,7 @@ for _logger_name in ("app.optimization", "app.api.routes.optimization"):
     _lg.propagate = False
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -98,8 +99,8 @@ async def _log_request(
                 created_at=datetime.now(timezone.utc),
             ))
             await session.commit()
-    except Exception:
-        pass  # never let logging break the response
+    except Exception as e:
+        logger.warning("Usage log write failed: %s", e)
 
 
 @app.middleware("http")

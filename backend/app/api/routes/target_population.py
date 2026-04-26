@@ -6,7 +6,7 @@ GET /target-populations/facility-types – List facility types with their defaul
 """
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,8 +24,7 @@ class TargetPopulationOut(BaseModel):
     min_age: int | None
     max_age: int | None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class FacilityTypeOut(BaseModel):
@@ -33,8 +32,7 @@ class FacilityTypeOut(BaseModel):
     label: str
     default_target_population_id: int | None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 @router.get("/", response_model=list[TargetPopulationOut])

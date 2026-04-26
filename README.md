@@ -23,6 +23,7 @@ This repository is the **web migration** of the original LIP2 Java desktop proto
 | **Multi-Country** | Switch between country databases (Ecuador, Belgium) via a dropdown |
 | **Geographic Scope** | Filter optimization by political divisions (region > province > municipality) |
 | **Target Population** | Per-facility-type population groups (school-age, patients, etc.) for demand weighting |
+| **Authentication** | JWT-based login with per-user database access control and admin panel |
 
 ---
 
@@ -71,16 +72,19 @@ PIL-web/
 │   │   ├── database.py              # Per-country async SQLAlchemy engine pool
 │   │   ├── dependencies.py          # X-LIP2-Database header → DB session injection
 │   │   ├── api/routes/
+│   │   │   ├── auth.py              # POST /auth/login · GET /auth/me · PUT /auth/me/password
+│   │   │   ├── admin.py             # CRUD /admin/users · GET /admin/stats
 │   │   │   ├── optimization.py      # POST /optimization/run · POST /{id}/rebalance
 │   │   │   ├── infrastructure.py    # CRUD /infrastructure/
 │   │   │   ├── impacts.py           # POST /impacts/calculate
 │   │   │   ├── reports.py           # GET  /reports/scenario/{id}/excel|json
 │   │   │   ├── political_divisions.py  # GET /political-divisions/tree
-│   │   │   └── target_population.py # GET /target-population/
+│   │   │   └── target_population.py # GET /target-populations/
 │   │   ├── models/                  # SQLAlchemy ORM models
 │   │   ├── schemas/                 # Pydantic request/response schemas
 │   │   └── optimization/            # Core algorithms
 │   │       ├── sparse_matrix.py     # CSR + CSC sparse distance matrix
+│   │       ├── assignment.py        # Capacity-constrained area assignment
 │   │       ├── p_median.py          # Greedy add + 1-opt exchange
 │   │       ├── p_center.py          # L-Layered search + greedy set cover
 │   │       ├── max_coverage.py      # GRASP + CMCLP-CAC capacitated assignment
@@ -96,11 +100,13 @@ PIL-web/
 │   ├── src/
 │   │   ├── App.jsx                  # Root layout, reoptimization flow, comparison overlay
 │   │   ├── components/
+│   │   │   ├── Auth/LoginPage.jsx   # Login form, password reset confirmation
+│   │   │   ├── Admin/AdminPanel.jsx # User management, database access control
 │   │   │   ├── Map/MapView.jsx      # MapLibre GL map, right-click menus, rebalancing lines
 │   │   │   └── Optimization/
 │   │   │       ├── OptimizationPanel.jsx       # Optimization form, results, rebalancing UI
 │   │   │       └── PoliticalDivisionTree.jsx   # Hierarchical scope filter tree
-│   │   └── services/api.js          # Axios API client (X-LIP2-Database header)
+│   │   └── services/api.js          # Axios API client (X-LIP2-Database header, JWT auth)
 │   ├── Dockerfile
 │   ├── fly.toml
 │   └── nginx.conf
@@ -260,6 +266,15 @@ The full interactive API documentation is available at `/docs` (Swagger UI) and 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/v1/databases` | List available country databases |
+| `POST` | `/api/v1/auth/login` | Authenticate (email + password → JWT) |
+| `GET` | `/api/v1/auth/me` | Current user info |
+| `PUT` | `/api/v1/auth/me/password` | Change own password |
+| `POST` | `/api/v1/auth/reset-password/confirm` | Confirm password reset via token |
+| `GET` | `/api/v1/admin/users` | List all users (admin only) |
+| `POST` | `/api/v1/admin/users` | Create a user (admin only) |
+| `PUT` | `/api/v1/admin/users/{id}` | Update user / database access (admin only) |
+| `POST` | `/api/v1/admin/users/{id}/reset` | Generate password reset link (admin only) |
+| `GET` | `/api/v1/admin/stats` | Usage statistics (admin only) |
 | `POST` | `/api/v1/optimization/run` | Submit a facility location optimization (async) |
 | `GET` | `/api/v1/optimization/` | List all scenarios |
 | `GET` | `/api/v1/optimization/{id}` | Get scenario with full facility locations |
@@ -272,10 +287,13 @@ The full interactive API documentation is available at `/docs` (Swagger UI) and 
 | `GET` | `/api/v1/reports/scenario/{id}/json` | Download JSON export |
 | `GET` | `/api/v1/political-divisions/tree` | Full political division hierarchy |
 | `POST` | `/api/v1/political-divisions/census-summary` | Census summary for selected parishes |
-| `GET` | `/api/v1/target-population/` | List census population groups (school-age, patients, etc.) |
+| `GET` | `/api/v1/target-populations/` | List census population groups (school-age, patients, etc.) |
+| `GET` | `/api/v1/target-populations/facility-types` | List facility types with their default target group |
 | `GET` | `/health` | Health check |
 
 All endpoints that access country data require the `X-LIP2-Database` header specifying the target database (e.g. `lip2_ecuador`).
+
+All endpoints except `/auth/login` and `/auth/reset-password/confirm` require a `Authorization: Bearer <token>` header obtained from the login endpoint.
 
 ### Example: Run a P-Median optimization
 
